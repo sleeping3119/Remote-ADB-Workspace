@@ -1,0 +1,143 @@
+{
+  "name": "remote-adb",
+  "displayName": "Remote ADB",
+  "description": "Remote ADB Extension for VS Code",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:remote-adb.devicesView",
+    "onCommand:remote-adb.connectUsb",
+    "onCommand:remote-adb.connectTcpip",
+    "onCommand:remote-adb.pairTcpip",
+    "onCommand:remote-adb.showLog",
+    "onFileSystem:remote-adb"
+  ],
+  "main": "./out/extension.js",
+  "capabilities": {
+    "virtualWorkspaces": true
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "remote-adb.connectUsb",
+        "title": "Remote ADB: Connect to USB Device"
+      },
+      {
+        "command": "remote-adb.connectTcpip",
+        "title": "Remote ADB: Connect via TCP/IP"
+      },
+      {
+        "command": "remote-adb.pairTcpip",
+        "title": "Remote ADB: Pair via TCP/IP"
+      },
+      {
+        "command": "remote-adb.switchDevice",
+        "title": "Remote ADB: Switch Active Device"
+      },
+      {
+        "command": "remote-adb.openWorkspace",
+        "title": "Remote ADB: Open Device Workspace"
+      },
+      {
+        "command": "remote-adb.showLog",
+        "title": "Remote ADB: Show ADB Logs"
+      },
+      {
+        "command": "remote-adb.refreshDevices",
+        "title": "Refresh Devices",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "remote-adb.openInCurrentWindow",
+        "title": "Open in Current Window"
+      },
+      {
+        "command": "remote-adb.openInNewWindow",
+        "title": "Open in New Window"
+      },
+      {
+        "command": "remote-adb.openFolder",
+        "title": "Remote ADB: Open Folder"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "remote-adb-container",
+          "title": "Remote ADB",
+          "icon": "$(device-mobile)"
+        }
+      ]
+    },
+    "views": {
+      "remote-adb-container": [
+        {
+          "id": "remote-adb.devicesView",
+          "name": "Android Devices"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "remote-adb.refreshDevices",
+          "when": "view == remote-adb.devicesView",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "remote-adb.openInCurrentWindow",
+          "when": "view == remote-adb.devicesView",
+          "group": "inline"
+        },
+        {
+          "command": "remote-adb.openInNewWindow",
+          "when": "view == remote-adb.devicesView",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Remote ADB",
+      "properties": {
+        "remote-adb.adbPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the custom ADB executable (leave blank to use automatically downloaded platform-tools)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "eslint": "^10.5.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  },
+  "dependencies": {
+    "adm-zip": "^0.6.0"
+  }
+}
