@@ -8,7 +8,9 @@ import { DeviceTreeProvider, DeviceTreeItem } from './tree/deviceTreeProvider';
 import { showFolderPicker } from './ui/folderPicker';
 import { ValidationManager } from './adb/validationManager';
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
+    /** Strip characters that are illegal in Windows filenames: / \ : * ? " < > | */
+    const sanitizeKey = (s: string) => s.replace(/\/+$/, '').replace(/[/\\:*?"<>|]/g, '_');
     Logger.initialize(context);
     console.log('Congratulations, your extension "remote-adb" is now active!');
 
@@ -36,19 +38,35 @@ export function activate(context: vscode.ExtensionContext) {
         const deviceId = folder.uri.authority;
         const folderPath = folder.uri.path;
         
-        const tempKey = `adbValidationManifest_${deviceId}_${folderPath}`;
-        const globalManifest = context.globalState.get(tempKey);
-        let manifestToLog = context.workspaceState.get('adbValidationManifest');
+        const tempKey = `adbValidationManifest_${sanitizeKey(deviceId)}_${sanitizeKey(folderPath)}.json`;
+        const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
         
-        if (globalManifest) {
+        Logger.logOutput(`[Extension Activate] Checking for manifest at: ${manifestUri.fsPath}`);
+        
+        let manifestToLog: any = undefined;
+        try {
+            const data = await vscode.workspace.fs.readFile(manifestUri);
+            const globalManifest = JSON.parse(new TextDecoder().decode(data));
+            Logger.logOutput(`[Extension Activate] Found global manifest file. Adopting to workspace state.`);
             manifestToLog = globalManifest;
-            // Adopt it into local workspace state and clear from global staging
+            
+            // Adopt it into local workspace state and clear the file
             context.workspaceState.update('adbValidationManifest', globalManifest);
-            context.globalState.update(tempKey, undefined);
+            try {
+                await vscode.workspace.fs.delete(manifestUri);
+            } catch (e) {
+                // Ignore delete errors
+            }
+        } catch (e) {
+            // File not found, fallback to workspace state
+            manifestToLog = context.workspaceState.get('adbValidationManifest');
+            Logger.logOutput(`[Extension Activate] No global manifest file found. Checked workspaceState: ${manifestToLog ? 'Found' : 'Not Found'}`);
         }
         
         if (manifestToLog) {
             Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(manifestToLog, null, 2)}`);
+        } else {
+            Logger.logOutput(`[Extension Activate] No manifest available to log.`);
         }
     }
 
@@ -108,15 +126,30 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
             
-            // Persist the manifest to global state for workspace reload scenarios
-            const tempKey = `adbValidationManifest_${active}_${folderPath}`;
-            await context.globalState.update(tempKey, manifest);
+            // Persist the manifest to global storage for workspace reload scenarios
+            const tempKey = `adbValidationManifest_${sanitizeKey(active)}_${sanitizeKey(folderPath)}.json`;
+            const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
+            
+            try {
+                // Ensure the global storage directory exists
+                await vscode.workspace.fs.createDirectory(context.globalStorageUri);
+                // Write the manifest to disk
+                const data = new TextEncoder().encode(JSON.stringify(manifest));
+                await vscode.workspace.fs.writeFile(manifestUri, data);
+                Logger.logOutput(`[Validation] Saved manifest to disk: ${manifestUri.fsPath}`);
+            } catch (e: any) {
+                Logger.logError(`[Validation] Failed to save manifest to disk: ${e.message}`);
+            }
             
             // Also persist to current workspace state
             await context.workspaceState.update('adbValidationManifest', manifest);
             
             // Log immediately in case the window doesn't reload
             Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(manifest, null, 2)}`);
+
+            // Give the extension host file system a moment to physically flush the JSON file 
+            // before the brutal restart caused by updateWorkspaceFolders.
+            await new Promise(resolve => setTimeout(resolve, 500));
 
             vscode.workspace.updateWorkspaceFolders(
                 vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders.length : 0,
@@ -152,11 +185,20 @@ export function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            // For a new window, global state might be needed to pass it across, but keeping it memory/workspaceState
-            // Note: workspaceState is isolated per workspace, but new window doesn't exist yet.
-            // We store it in global state temporarily with a key, and let the new window pick it up.
-            const tempKey = `adbValidationManifest_${deviceItem.device.id}_${folderPath}`;
-            await context.globalState.update(tempKey, manifest);
+            // For a new window, write it to globalStorageUri so the new window can pick it up
+            const tempKey = `adbValidationManifest_${sanitizeKey(deviceItem.device.id)}_${sanitizeKey(folderPath)}.json`;
+            const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
+            
+            try {
+                await vscode.workspace.fs.createDirectory(context.globalStorageUri);
+                const data = new TextEncoder().encode(JSON.stringify(manifest));
+                await vscode.workspace.fs.writeFile(manifestUri, data);
+            } catch (e: any) {
+                Logger.logError(`[Validation] Failed to save manifest to disk for new window: ${e.message}`);
+            }
+
+            // Small delay to ensure file system flush
+            await new Promise(resolve => setTimeout(resolve, 500));
 
             const uri = vscode.Uri.parse(`remote-adb://${deviceItem.device.id}${folderPath}`);
             vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true });
