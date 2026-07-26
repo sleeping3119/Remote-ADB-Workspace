@@ -54,11 +54,13 @@
       },
       {
         "command": "remote-adb.openInCurrentWindow",
-        "title": "Open in Current Window"
+        "title": "Open in Current Window",
+        "icon": "$(folder-opened)"
       },
       {
         "command": "remote-adb.openInNewWindow",
-        "title": "Open in New Window"
+        "title": "Open in New Window",
+        "icon": "$(empty-window)"
       },
       {
         "command": "remote-adb.openFolder",
@@ -79,6 +81,10 @@
       {
         "command": "remote-adb.switchUserShell",
         "title": "Switch User: Shell"
+      },
+      {
+        "command": "remote-adb.acceptFolderPicker",
+        "title": "Accept Folder Picker"
       }
     ],
     "viewsContainers": {
@@ -139,6 +145,13 @@
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "remote-adb.acceptFolderPicker",
+        "key": "shift+enter",
+        "when": "inQuickOpen && remoteAdbFolderPickerActive"
+      }
+    ],
     "configuration": {
       "title": "Remote ADB",
       "properties": {

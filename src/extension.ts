@@ -5,7 +5,7 @@ import { ToyboxManager } from './adb/toyboxManager';
 import { AdbFileSystemProvider } from './fs/adbFileSystemProvider';
 import { Logger } from './logger';
 import { DeviceTreeProvider, DeviceTreeItem } from './tree/deviceTreeProvider';
-import { showFolderPicker } from './ui/folderPicker';
+import { showFolderPicker, triggerAcceptFolderPicker } from './ui/folderPicker';
 import { ValidationManager } from './adb/validationManager';
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -109,6 +109,12 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    context.subscriptions.push(vscode.commands.registerCommand('remote-adb.acceptFolderPicker', () => {
+        if (triggerAcceptFolderPicker) {
+            triggerAcceptFolderPicker();
+        }
+    }));
+
     // Command: Open Folder
     let openFolderDisposable = vscode.commands.registerCommand('remote-adb.openFolder', async (deviceItem?: DeviceTreeItem) => {
         let active = deviceItem ? deviceItem.device.id : connectionManager.getActiveDevice();
@@ -119,7 +125,11 @@ export async function activate(context: vscode.ExtensionContext) {
         
         const shell = await connectionManager.getPersistentShell(active);
         const pwd = await shell.executeCommand('pwd');
-        const initialPath = pwd.trim() || '/';
+        let initialPath = pwd.trim() || '/';
+        const user = await shell.getCurrentUser();
+        if (user.name === 'shell' && initialPath === '/') {
+            initialPath = '/data/local/tmp';
+        }
         const folderPath = await showFolderPicker(active, fsProvider, initialPath);
         if (folderPath) {
             // Stage 1-6: Target Path Validation Phase
@@ -281,7 +291,11 @@ export async function activate(context: vscode.ExtensionContext) {
         
         const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
         const pwd = await shell.executeCommand('pwd');
-        const initialPath = pwd.trim() || '/';
+        let initialPath = pwd.trim() || '/';
+        const user = await shell.getCurrentUser();
+        if (user.name === 'shell' && initialPath === '/') {
+            initialPath = '/data/local/tmp';
+        }
         const folderPath = await showFolderPicker(deviceItem.device.id, fsProvider, initialPath);
         if (folderPath) {
             // Stage 1-6: Target Path Validation Phase

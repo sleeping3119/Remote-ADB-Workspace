@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { AdbFileSystemProvider } from '../fs/adbFileSystemProvider';
 
+export let triggerAcceptFolderPicker: (() => void) | undefined;
+
 export async function showFolderPicker(
     deviceId: string,
     fsProvider: AdbFileSystemProvider,
@@ -10,12 +12,12 @@ export async function showFolderPicker(
         const quickPick = vscode.window.createQuickPick();
         quickPick.title = 'Remote ADB: Select Folder';
         quickPick.placeholder = 'Type an absolute path to navigate...';
-        quickPick.ignoreFocusOut = true;
+        quickPick.ignoreFocusOut = false;
         quickPick.matchOnDescription = true;
 
         const okButton: vscode.QuickInputButton = {
             iconPath: new vscode.ThemeIcon('check'),
-            tooltip: 'Select and Open this Folder'
+            tooltip: 'Select and Open this Folder (Shift+Enter)'
         };
         
         quickPick.buttons = [okButton];
@@ -146,35 +148,45 @@ export async function showFolderPicker(
             }
         });
 
+        const handleAccept = async () => {
+            const typedValue = quickPick.value;
+            quickPick.busy = true;
+            try {
+                const checkPath = typedValue.endsWith('/') ? typedValue : typedValue + '/';
+                const uri = vscode.Uri.parse(`remote-adb://${deviceId}${checkPath}`);
+                
+                // Explicitly verify read/execute permissions for final workspace folder
+                const isAccessible = await fsProvider.isWorkspaceAccessible(uri);
+                
+                if (isAccessible) {
+                    quickPick.hide();
+                    resolve(checkPath);
+                } else {
+                    vscode.window.showErrorMessage(`Permission denied or invalid directory: ${typedValue}`);
+                }
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`Error checking path: ${typedValue}`);
+            } finally {
+                quickPick.busy = false;
+            }
+        };
+
+        triggerAcceptFolderPicker = handleAccept;
+
         quickPick.onDidTriggerButton(async (button) => {
             if (button === okButton) {
-                const typedValue = quickPick.value;
-                quickPick.busy = true;
-                try {
-                    const checkPath = typedValue.endsWith('/') ? typedValue : typedValue + '/';
-                    const uri = vscode.Uri.parse(`remote-adb://${deviceId}${checkPath}`);
-                    
-                    // Explicitly verify read/execute permissions for final workspace folder
-                    const isAccessible = await fsProvider.isWorkspaceAccessible(uri);
-                    
-                    if (isAccessible) {
-                        quickPick.hide();
-                        resolve(checkPath);
-                    } else {
-                        vscode.window.showErrorMessage(`Permission denied or invalid directory: ${typedValue}`);
-                    }
-                } catch (e: any) {
-                    vscode.window.showErrorMessage(`Error checking path: ${typedValue}`);
-                } finally {
-                    quickPick.busy = false;
-                }
+                await handleAccept();
             }
         });
 
         quickPick.onDidHide(() => {
+            triggerAcceptFolderPicker = undefined;
+            vscode.commands.executeCommand('setContext', 'remoteAdbFolderPickerActive', false);
             quickPick.dispose();
             resolve(undefined);
         });
+
+        vscode.commands.executeCommand('setContext', 'remoteAdbFolderPickerActive', true);
 
         loadDirectory(currentLoadedPath, true);
         quickPick.show();
