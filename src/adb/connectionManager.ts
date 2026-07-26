@@ -12,12 +12,12 @@ export class PersistentAdbShell {
     private buffer: string = '';
     private currentResolve: ((data: string) => void) | null = null;
     private currentReject: ((err: Error) => void) | null = null;
-    private commandQueue: { command: string, resolve: (data: string) => void, reject: (err: Error) => void }[] = [];
+    private commandQueue: { command: string, resolve: (data: string) => void, reject: (err: Error) => void, isRaw?: boolean }[] = [];
     private isBusy = false;
     private currentUser: { name: string, groups: string[] } | null = null;
 
-    public async getCurrentUser(): Promise<{ name: string, groups: string[] }> {
-        if (this.currentUser) return this.currentUser;
+    public async getCurrentUser(forceRefresh: boolean = false): Promise<{ name: string, groups: string[] }> {
+        if (this.currentUser && !forceRefresh) return this.currentUser;
         
         try {
             // Using 'toybox id' ensures consistent output across devices. 
@@ -32,6 +32,10 @@ export class PersistentAdbShell {
             this.currentUser = { name: 'shell', groups: ['shell'] };
         }
         return this.currentUser;
+    }
+
+    public refreshCurrentUser(): void {
+        this.currentUser = null;
     }
 
     constructor(adbPath: string, deviceId: string) {
@@ -95,6 +99,18 @@ export class PersistentAdbShell {
         });
     }
 
+    public async sendRawCommand(command: string): Promise<void> {
+        return new Promise((resolve, reject) => {
+            this.commandQueue.push({
+                command,
+                isRaw: true,
+                resolve: () => resolve(),
+                reject
+            });
+            this.processNext();
+        });
+    }
+
     private processNext() {
         if (this.isBusy || this.commandQueue.length === 0) {return;}
         
@@ -103,6 +119,20 @@ export class PersistentAdbShell {
         this.currentResolve = next.resolve;
         this.currentReject = next.reject;
         
+        if (next.isRaw) {
+            Logger.logCommand(`[Persistent Shell Raw] ${next.command}`);
+            this.process.stdin?.write(`${next.command}\n`);
+            
+            // For raw commands (like su or run-as), there is no EOF marker.
+            // We just wait a short time for the shell to process it, then resolve.
+            setTimeout(() => {
+                this.isBusy = false;
+                next.resolve('');
+                this.processNext();
+            }, 500);
+            return;
+        }
+
         // Execute the command in a subshell or group to capture all output
         // and echo the delimiter immediately after.
         Logger.logCommand(`[Persistent Shell] ${next.command}`);
@@ -152,6 +182,31 @@ export class ConnectionManager {
             this.shells.set(realId, new PersistentAdbShell(adbPath, realId));
         }
         return this.shells.get(realId)!;
+    }
+
+    public getPersistentShellIfExists(deviceId: string): PersistentAdbShell | undefined {
+        const lower = deviceId.toLowerCase();
+        const realId = this.deviceIdMap.get(lower) || deviceId;
+        return this.shells.get(realId);
+    }
+
+    public async getQuickUser(deviceId: string): Promise<string> {
+        const shell = this.getPersistentShellIfExists(deviceId);
+        if (shell) {
+            const user = await shell.getCurrentUser();
+            return user.name;
+        }
+        try {
+            const adbPath = await this.toolsManager.getAdbPath();
+            const cp = require('child_process');
+            return await new Promise((resolve) => {
+                cp.exec(`"${adbPath}" -s ${deviceId} shell id -un`, (err: any, stdout: string) => {
+                    resolve(stdout.trim() || 'shell');
+                });
+            });
+        } catch(e) {
+            return 'shell';
+        }
     }
 
     public async closePersistentShell(deviceId: string): Promise<void> {

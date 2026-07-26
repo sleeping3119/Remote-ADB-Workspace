@@ -4,11 +4,12 @@ import { ConnectionManager, AdbDevice } from '../adb/connectionManager';
 export class DeviceTreeItem extends vscode.TreeItem {
     constructor(
         public readonly device: AdbDevice,
+        public readonly username?: string,
         public readonly command?: vscode.Command
     ) {
-        super(device.id, vscode.TreeItemCollapsibleState.None);
+        super(`${device.id} (${username || 'unknown'})`, vscode.TreeItemCollapsibleState.None);
 
-        this.tooltip = `Device: ${device.id}\nStatus: ${device.status}`;
+        this.tooltip = `Device: ${device.id}\nStatus: ${device.status}${username ? '\nUser: ' + username : ''}`;
         this.description = device.status;
         this.iconPath = new vscode.ThemeIcon('device-mobile');
         
@@ -37,11 +38,17 @@ export class DeviceTreeProvider implements vscode.TreeDataProvider<DeviceTreeIte
         }
 
         try {
-            // Force fetch latest devices if needed, but connectionManager.getDevices caches if there's a pending call.
-            // We should ideally fetch real devices. Wait, ConnectionManager caches the promise of getDevices, but only while pending.
-            // So it does a real fetch each time.
             const devices = await this.connectionManager.getDevices();
-            return devices.map(device => new DeviceTreeItem(device));
+            const items = [];
+            for (const device of devices) {
+                // If device is offline/unauthorized, we might not be able to fetch the user safely without hanging or errors
+                let username = 'shell';
+                if (device.status === 'device') {
+                    username = await this.connectionManager.getQuickUser(device.id);
+                }
+                items.push(new DeviceTreeItem(device, username));
+            }
+            return items;
         } catch (error) {
             vscode.window.showErrorMessage('Failed to fetch ADB devices');
             return [];

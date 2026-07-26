@@ -32,7 +32,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const targetPath = uri.path;
         
         const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
         // Using toybox stat to get FileType (hex mode), Size, and Modification time (seconds since epoch)
         const output = await shell.executeCommand(`${prefix} stat -c "%f %s %Y" "${targetPath}"`);
@@ -79,7 +80,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const targetPath = uri.path;
         
         const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
         // toybox ls -1p prints one entry per line, with a trailing '/' for directories
         const output = await shell.executeCommand(`${prefix} ls -1p "${targetPath}"`);
@@ -126,8 +128,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const targetPath = uri.path;
         
         const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId);
         const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
         // toybox ls -l prints detailed format. We filter for directories 'd' and symlinks 'l'
         // Using sed to drop total lines or errors if they slip through, but grep '^[dl]' handles it mostly.
@@ -250,7 +252,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;
         const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
         await shell.executeCommand(`${prefix} mkdir -p "${targetPath}"`);
         this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Created, uri }]);
@@ -260,7 +263,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;
         const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
         const rmArgs = options.recursive ? '-rf' : '-f';
         await shell.executeCommand(`${prefix} rm ${rmArgs} "${targetPath}"`);
@@ -273,7 +277,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const newPath = newUri.path;
         
         const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
         await shell.executeCommand(`${prefix} mv "${oldPath}" "${newPath}"`);
         this._onDidChangeFile.fire([

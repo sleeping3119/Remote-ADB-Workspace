@@ -77,11 +77,11 @@ export class ValidationManager {
             cancellable: true
         }, async (progress, token) => {
             const shell = await this.connectionManager.getPersistentShell(deviceId);
-            const prefix = await this.toyboxManager.getToyboxPrefix(deviceId);
+            const currentUser = await shell.getCurrentUser();
+            const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
 
             // Stage 0: Privilege Discovery
             progress.report({ message: 'Checking privileges...' });
-            const currentUser = await shell.getCurrentUser();
             let isRootAvailable = false;
             try {
                 const suCheck = await shell.executeCommand(`su -c id 2>/dev/null`);

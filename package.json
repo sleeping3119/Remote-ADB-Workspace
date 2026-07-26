@@ -63,6 +63,22 @@
       {
         "command": "remote-adb.openFolder",
         "title": "Remote ADB: Open Folder"
+      },
+      {
+        "command": "remote-adb.switchUserRoot",
+        "title": "Switch User: Root"
+      },
+      {
+        "command": "remote-adb.switchUserTermux",
+        "title": "Switch User: Termux"
+      },
+      {
+        "command": "remote-adb.switchUserCustom",
+        "title": "Switch User: Custom App..."
+      },
+      {
+        "command": "remote-adb.switchUserShell",
+        "title": "Switch User: Shell"
       }
     ],
     "viewsContainers": {
@@ -100,6 +116,26 @@
           "command": "remote-adb.openInNewWindow",
           "when": "view == remote-adb.devicesView",
           "group": "inline"
+        },
+        {
+          "command": "remote-adb.switchUserRoot",
+          "when": "view == remote-adb.devicesView && viewItem == adbDevice",
+          "group": "2_switch@1"
+        },
+        {
+          "command": "remote-adb.switchUserTermux",
+          "when": "view == remote-adb.devicesView && viewItem == adbDevice",
+          "group": "2_switch@2"
+        },
+        {
+          "command": "remote-adb.switchUserCustom",
+          "when": "view == remote-adb.devicesView && viewItem == adbDevice",
+          "group": "2_switch@3"
+        },
+        {
+          "command": "remote-adb.switchUserShell",
+          "when": "view == remote-adb.devicesView && viewItem == adbDevice",
+          "group": "2_switch@4"
         }
       ]
     },

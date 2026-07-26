@@ -7,6 +7,9 @@ import * as vscode from 'vscode';
 import { PlatformToolsManager } from './platformToolsManager';
 import { Logger } from '../logger';
 
+const RAW_DIR = '/data/local/tmp/.raw';
+const TOYBOX_PATH = `${RAW_DIR}/toybox`;
+
 export class ToyboxManager {
     private toolsManager: PlatformToolsManager;
     private context: vscode.ExtensionContext;
@@ -18,45 +21,50 @@ export class ToyboxManager {
         this.context = context;
     }
 
-    public async getToyboxPrefix(deviceId: string): Promise<string> {
-        if (this.cachedPrefixes.has(deviceId)) {
-            return this.cachedPrefixes.get(deviceId)!;
+    public async getToyboxPrefix(deviceId: string, username: string = 'shell'): Promise<string> {
+        const key = `${deviceId}_${username}`;
+        if (this.cachedPrefixes.has(key)) {
+            return this.cachedPrefixes.get(key)!;
         }
 
-        if (this.pendingPrefixes.has(deviceId)) {
-            return this.pendingPrefixes.get(deviceId)!;
+        if (this.pendingPrefixes.has(key)) {
+            return this.pendingPrefixes.get(key)!;
         }
 
-        const promise = this._resolveToyboxPrefix(deviceId);
-        this.pendingPrefixes.set(deviceId, promise);
+        const promise = this._resolveToyboxPrefix(deviceId, username);
+        this.pendingPrefixes.set(key, promise);
 
         try {
             const prefix = await promise;
-            this.cachedPrefixes.set(deviceId, prefix);
+            this.cachedPrefixes.set(key, prefix);
             return prefix;
         } finally {
-            this.pendingPrefixes.delete(deviceId);
+            this.pendingPrefixes.delete(key);
         }
     }
 
-    private async _resolveToyboxPrefix(deviceId: string): Promise<string> {
+    public setToyboxPrefix(deviceId: string, username: string, prefix: string): void {
+        const key = `${deviceId}_${username}`;
+        this.cachedPrefixes.set(key, prefix);
+    }
+
+    private async _resolveToyboxPrefix(deviceId: string, username: string): Promise<string> {
 
         // 1. Check if natively available
         try {
             await this.execAdb(deviceId, 'shell toybox --version');
-            this.cachedPrefixes.set(deviceId, 'toybox');
+            this.setToyboxPrefix(deviceId, username, 'toybox');
             return 'toybox';
         } catch (e) {
-            // Natively not available, proceed to check /data/local/tmp/toybox
+            // Natively not available, proceed to check TOYBOX_PATH
         }
 
-        const tmpToyboxPath = '/data/local/tmp/toybox';
         try {
-            await this.execAdb(deviceId, `shell ${tmpToyboxPath} --version`);
-            this.cachedPrefixes.set(deviceId, tmpToyboxPath);
-            return tmpToyboxPath;
+            await this.execAdb(deviceId, `shell ${TOYBOX_PATH} --version`);
+            this.setToyboxPrefix(deviceId, username, TOYBOX_PATH);
+            return TOYBOX_PATH;
         } catch (e) {
-            // Not in tmp either
+            // Not in .raw either
         }
 
         // 2. Need to download and push
@@ -81,11 +89,13 @@ export class ToyboxManager {
             }
 
             progress.report({ message: `Pushing toybox to device...` });
-            await this.execAdb(deviceId, `push "${localToyboxPath}" ${tmpToyboxPath}`);
-            await this.execAdb(deviceId, `shell chmod +x ${tmpToyboxPath}`);
+            await this.execAdb(deviceId, `shell mkdir -p ${RAW_DIR}`);
+            await this.execAdb(deviceId, `shell chmod 775 ${RAW_DIR}`);
+            await this.execAdb(deviceId, `push "${localToyboxPath}" ${TOYBOX_PATH}`);
+            await this.execAdb(deviceId, `shell chmod 774 ${TOYBOX_PATH}`);
 
-            this.cachedPrefixes.set(deviceId, tmpToyboxPath);
-            return tmpToyboxPath;
+            this.setToyboxPrefix(deviceId, username, TOYBOX_PATH);
+            return TOYBOX_PATH;
         });
     }
 

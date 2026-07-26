@@ -117,7 +117,10 @@ export async function activate(context: vscode.ExtensionContext) {
             return;
         }
         
-        const folderPath = await showFolderPicker(active, fsProvider);
+        const shell = await connectionManager.getPersistentShell(active);
+        const pwd = await shell.executeCommand('pwd');
+        const initialPath = pwd.trim() || '/';
+        const folderPath = await showFolderPicker(active, fsProvider, initialPath);
         if (folderPath) {
             // Stage 1-6: Target Path Validation Phase
             const manifest = await validationManager.validateWorkspace(active, folderPath);
@@ -159,6 +162,105 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    async function setupAppEnvironment(deviceId: string, pkgName: string, shell: import('./adb/connectionManager').PersistentAdbShell, targetFolder: string = '.raw') {
+        return new Promise<boolean>(async (resolve) => {
+            const cp = require('child_process');
+            const adbPath = await toolsManager.getAdbPath();
+            cp.exec(`"${adbPath}" -s ${deviceId} shell run-as ${pkgName} id`, async (err: any, stdout: string, stderr: string) => {
+                const out = (stdout + '' + stderr).toLowerCase();
+                if (out.includes('unknown package') || out.includes('is not installed')) {
+                    vscode.window.showErrorMessage(`Package not installed: ${pkgName}`);
+                    return resolve(false);
+                }
+                if (out.includes('not debuggable') || out.includes('not an application') || err) {
+                    vscode.window.showErrorMessage(`Package not debuggable or run-as failed: ${pkgName}`);
+                    return resolve(false);
+                }
+                
+                let user = await shell.getCurrentUser();
+                if (user.name !== 'shell') {
+                    await shell.sendRawCommand('exit');
+                    shell.refreshCurrentUser();
+                }
+                
+                await shell.sendRawCommand(`run-as ${pkgName}`);
+                shell.refreshCurrentUser();
+                user = await shell.getCurrentUser();
+                
+                const checkRaw = await shell.executeCommand('ls -A /data/local/tmp/.raw 2>/dev/null');
+                if (checkRaw.trim()) {
+                    const testLocal = await shell.executeCommand(`${targetFolder}/toybox --version`);
+                    if (testLocal.includes('not found') || testLocal.includes('inaccessible') || testLocal.includes('No such file')) {
+                        if (targetFolder.includes('/')) {
+                            const parent = targetFolder.substring(0, targetFolder.lastIndexOf('/'));
+                            await shell.executeCommand(`mkdir -p ${parent}`);
+                        }
+                        await shell.executeCommand(`mkdir -p ${targetFolder}`);
+                        await shell.executeCommand(`cat /data/local/tmp/.raw/toybox > ${targetFolder}/toybox`);
+                        await shell.executeCommand(`chmod 700 ${targetFolder}/toybox`);
+                    }
+                    toyboxManager.setToyboxPrefix(deviceId, user.name, `${targetFolder}/toybox`);
+                } else {
+                    toyboxManager.setToyboxPrefix(deviceId, user.name, 'toybox');
+                }
+                vscode.window.showInformationMessage(`Switched to ${pkgName}`);
+                vscode.commands.executeCommand('remote-adb.refreshDevices');
+                resolve(true);
+            });
+        });
+    }
+
+    context.subscriptions.push(vscode.commands.registerCommand('remote-adb.switchUserRoot', async (deviceItem: DeviceTreeItem) => {
+        if (!deviceItem) return;
+        const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
+        
+        let user = await shell.getCurrentUser();
+        if (user.name !== 'shell') {
+            await shell.sendRawCommand('exit');
+            shell.refreshCurrentUser();
+        }
+
+        await shell.sendRawCommand('su');
+        shell.refreshCurrentUser();
+        user = await shell.getCurrentUser();
+        if (user.name !== 'root') {
+            await shell.sendRawCommand('exit');
+            vscode.window.showErrorMessage('Failed to switch to root. Device might not be rooted.');
+        } else {
+            vscode.window.showInformationMessage('Switched to root');
+            vscode.commands.executeCommand('remote-adb.refreshDevices');
+        }
+    }));
+
+    context.subscriptions.push(vscode.commands.registerCommand('remote-adb.switchUserTermux', async (deviceItem: DeviceTreeItem) => {
+        if (!deviceItem) return;
+        const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
+        await setupAppEnvironment(deviceItem.device.id, 'com.termux', shell, './files/home/.raw');
+    }));
+
+    context.subscriptions.push(vscode.commands.registerCommand('remote-adb.switchUserCustom', async (deviceItem: DeviceTreeItem) => {
+        if (!deviceItem) return;
+        const pkgName = await vscode.window.showInputBox({ prompt: 'Enter package name of debuggable app' });
+        if (!pkgName) return;
+        const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
+        await setupAppEnvironment(deviceItem.device.id, pkgName, shell);
+    }));
+
+    context.subscriptions.push(vscode.commands.registerCommand('remote-adb.switchUserShell', async (deviceItem: DeviceTreeItem) => {
+        if (!deviceItem) return;
+        const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
+        let user = await shell.getCurrentUser();
+        if (user.name === 'shell') {
+            vscode.window.showInformationMessage('Already in shell environment');
+            return;
+        }
+        await shell.sendRawCommand('exit');
+        shell.refreshCurrentUser();
+        user = await shell.getCurrentUser();
+        vscode.window.showInformationMessage('Switched to shell');
+        vscode.commands.executeCommand('remote-adb.refreshDevices');
+    }));
+
     let openInCurrentWindowDisposable = vscode.commands.registerCommand('remote-adb.openInCurrentWindow', async (deviceItem: DeviceTreeItem) => {
         if (!deviceItem) return;
         vscode.window.withProgress({
@@ -177,7 +279,10 @@ export async function activate(context: vscode.ExtensionContext) {
         connectionManager.setActiveDevice(deviceItem.device.id);
         updateStatusBar();
         
-        const folderPath = await showFolderPicker(deviceItem.device.id, fsProvider);
+        const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
+        const pwd = await shell.executeCommand('pwd');
+        const initialPath = pwd.trim() || '/';
+        const folderPath = await showFolderPicker(deviceItem.device.id, fsProvider, initialPath);
         if (folderPath) {
             // Stage 1-6: Target Path Validation Phase
             const manifest = await validationManager.validateWorkspace(deviceItem.device.id, folderPath);
