@@ -34,9 +34,15 @@ export async function activate(context: vscode.ExtensionContext) {
     // If we are opening a remote-adb workspace, retrieve the manifest and log it
     const adbFolders = vscode.workspace.workspaceFolders?.filter(f => f.uri.scheme === 'remote-adb');
     if (adbFolders && adbFolders.length > 0) {
-        const folder = adbFolders[0];
-        const deviceId = folder.uri.authority;
-        const folderPath = folder.uri.path;
+        // Create an initialization lock IMMEDIATELY to block early FS operations
+        let resolveInit!: () => void;
+        const initPromise = new Promise<void>(r => resolveInit = r);
+        connectionManager.setShellInitializing(initPromise);
+
+        try {
+            const folder = adbFolders[0];
+            const deviceId = folder.uri.authority;
+            const folderPath = folder.uri.path;
         
         const tempKey = `adbValidationManifest_${sanitizeKey(deviceId)}_${sanitizeKey(folderPath)}.json`;
         const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
@@ -65,8 +71,31 @@ export async function activate(context: vscode.ExtensionContext) {
         
         if (manifestToLog) {
             Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(manifestToLog, null, 2)}`);
+            
+            // Auto-restore environment if required
+            const switchCmd = manifestToLog.privilegeContext?.switchCommand;
+            if (switchCmd && switchCmd.type !== 'shell') {
+                const shell = await connectionManager.getPersistentShell(deviceId);
+                const currentUser = await shell.getCurrentUser();
+                
+                if (currentUser.name === 'shell') {
+                    Logger.logOutput(`[Extension Activate] Restoring active user environment: ${switchCmd.type}`);
+                    if (switchCmd.type === 'root') {
+                        await shell.sendRawCommand('su');
+                        shell.refreshCurrentUser();
+                        shell.activeSwitchCommand = { type: 'root' };
+                    } else if (switchCmd.type === 'termux') {
+                        await setupAppEnvironment(deviceId, 'com.termux', shell, './files/home/.raw');
+                    } else if (switchCmd.type === 'custom' && switchCmd.pkgName) {
+                        await setupAppEnvironment(deviceId, switchCmd.pkgName, shell);
+                    }
+                }
+            }
         } else {
             Logger.logOutput(`[Extension Activate] No manifest available to log.`);
+        }
+        } finally {
+            resolveInit();
         }
     }
 
@@ -213,6 +242,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 } else {
                     toyboxManager.setToyboxPrefix(deviceId, user.name, 'toybox');
                 }
+                shell.activeSwitchCommand = { type: pkgName === 'com.termux' ? 'termux' : 'custom', pkgName };
                 vscode.window.showInformationMessage(`Switched to ${pkgName}`);
                 vscode.commands.executeCommand('remote-adb.refreshDevices');
                 resolve(true);
@@ -237,6 +267,7 @@ export async function activate(context: vscode.ExtensionContext) {
             await shell.sendRawCommand('exit');
             vscode.window.showErrorMessage('Failed to switch to root. Device might not be rooted.');
         } else {
+            shell.activeSwitchCommand = { type: 'root' };
             vscode.window.showInformationMessage('Switched to root');
             vscode.commands.executeCommand('remote-adb.refreshDevices');
         }
@@ -267,6 +298,7 @@ export async function activate(context: vscode.ExtensionContext) {
         await shell.sendRawCommand('exit');
         shell.refreshCurrentUser();
         user = await shell.getCurrentUser();
+        shell.activeSwitchCommand = { type: 'shell' };
         vscode.window.showInformationMessage('Switched to shell');
         vscode.commands.executeCommand('remote-adb.refreshDevices');
     }));

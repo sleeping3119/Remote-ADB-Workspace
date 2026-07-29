@@ -7,7 +7,10 @@ export interface AdbDevice {
     status: string;
 }
 
+export type SwitchCommandState = { type: 'root' | 'termux' | 'custom' | 'shell', pkgName?: string };
+
 export class PersistentAdbShell {
+    public activeSwitchCommand?: SwitchCommandState;
     private process: cp.ChildProcess;
     private buffer: string = '';
     private currentResolve: ((data: string) => void) | null = null;
@@ -149,6 +152,7 @@ export class ConnectionManager {
     private activeDeviceId: string | undefined;
     private shells: Map<string, PersistentAdbShell> = new Map();
     private deviceIdMap: Map<string, string> = new Map();
+    private shellReadyPromise: Promise<void> | null = null;
 
     constructor(toolsManager: PlatformToolsManager) {
         this.toolsManager = toolsManager;
@@ -161,6 +165,16 @@ export class ConnectionManager {
 
     public getActiveDevice(): string | undefined {
         return this.activeDeviceId;
+    }
+
+    public setShellInitializing(promise: Promise<void>) {
+        this.shellReadyPromise = promise;
+    }
+
+    public async waitForShellReady(): Promise<void> {
+        if (this.shellReadyPromise) {
+            await this.shellReadyPromise;
+        }
     }
 
     public async resolveDeviceId(idFromUri: string): Promise<string> {

@@ -28,6 +28,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     async stat(uri: vscode.Uri): Promise<vscode.FileStat> {
+        await this.connectionManager.waitForShellReady();
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;
         
@@ -76,6 +77,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     async readDirectory(uri: vscode.Uri): Promise<[string, vscode.FileType][]> {
+        await this.connectionManager.waitForShellReady();
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;
         
@@ -108,7 +110,90 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         return entries;
     }
 
-    private isAccessible(perms: string, owner: string, group: string, user: { name: string, groups: string[] }): boolean {
+
+    async readFile(uri: vscode.Uri): Promise<Uint8Array> {
+        await this.connectionManager.waitForShellReady();
+        const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
+        const targetPath = uri.path;
+        
+        const tmpFile = path.join(os.tmpdir(), `adb-fs-pull-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
+        try {
+            await this.connectionManager.executeCommandForDevice(deviceId, `pull "${targetPath}" "${tmpFile}"`);
+            const data = await fs.promises.readFile(tmpFile);
+            return data;
+        } catch (e: any) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        } finally {
+            if (fs.existsSync(tmpFile)) {
+                fs.unlinkSync(tmpFile);
+            }
+        }
+    }
+
+    async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean, overwrite: boolean }): Promise<void> {
+        await this.connectionManager.waitForShellReady();
+        const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
+        const targetPath = uri.path;
+        
+        const tmpFile = path.join(os.tmpdir(), `adb-fs-push-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
+        try {
+            await fs.promises.writeFile(tmpFile, content);
+            await this.connectionManager.executeCommandForDevice(deviceId, `push "${tmpFile}" "${targetPath}"`);
+            this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Changed, uri }]);
+        } catch (e: any) {
+            throw vscode.FileSystemError.Unavailable(uri);
+        } finally {
+            if (fs.existsSync(tmpFile)) {
+                fs.unlinkSync(tmpFile);
+            }
+        }
+    }
+
+    async createDirectory(uri: vscode.Uri): Promise<void> {
+        await this.connectionManager.waitForShellReady();
+        const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
+        const targetPath = uri.path;
+        const shell = await this.connectionManager.getPersistentShell(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+        
+        await shell.executeCommand(`${prefix} mkdir -p "${targetPath}"`);
+        this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Created, uri }]);
+    }
+
+    async delete(uri: vscode.Uri, options: { recursive: boolean }): Promise<void> {
+        await this.connectionManager.waitForShellReady();
+        const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
+        const targetPath = uri.path;
+        const shell = await this.connectionManager.getPersistentShell(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+        
+        const rmArgs = options.recursive ? '-rf' : '-f';
+        await shell.executeCommand(`${prefix} rm ${rmArgs} "${targetPath}"`);
+        this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
+    }
+
+    async rename(oldUri: vscode.Uri, newUri: vscode.Uri, options: { overwrite: boolean }): Promise<void> {
+        await this.connectionManager.waitForShellReady();
+        const deviceId = await this.connectionManager.resolveDeviceId(oldUri.authority);
+        const oldPath = oldUri.path;
+        const newPath = newUri.path;
+        
+        const shell = await this.connectionManager.getPersistentShell(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+        
+        await shell.executeCommand(`${prefix} mv "${oldPath}" "${newPath}"`);
+        this._onDidChangeFile.fire([
+            { type: vscode.FileChangeType.Deleted, uri: oldUri },
+            { type: vscode.FileChangeType.Created, uri: newUri }
+        ]);
+    }
+
+
+    //Following code is for folder picker and will not be used if workspace is opended already
+    private isAccessibleFolderPicker(perms: string, owner: string, group: string, user: { name: string, groups: string[] }): boolean {
         if (user.name === 'root') return true;
         
         let rIndex = 7;
@@ -191,7 +276,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             if (perms.includes('?')) continue;
             
             const type = perms[0] === 'd' ? vscode.FileType.Directory : vscode.FileType.SymbolicLink;
-            const accessible = this.isAccessible(perms, owner, group, currentUser);
+            const accessible = this.isAccessibleFolderPicker(perms, owner, group, currentUser);
             
             entries.push({ name, type, accessible });
         }
@@ -210,80 +295,5 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const output = await shell.executeCommand(`[ -d "${targetPath}" ] && [ -r "${targetPath}" ] && [ -x "${targetPath}" ] && echo "OK"`);
         
         return output.trim() === 'OK';
-    }
-
-    async readFile(uri: vscode.Uri): Promise<Uint8Array> {
-        const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
-        const targetPath = uri.path;
-        
-        const tmpFile = path.join(os.tmpdir(), `adb-fs-pull-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
-        try {
-            await this.connectionManager.executeCommandForDevice(deviceId, `pull "${targetPath}" "${tmpFile}"`);
-            const data = await fs.promises.readFile(tmpFile);
-            return data;
-        } catch (e: any) {
-            throw vscode.FileSystemError.FileNotFound(uri);
-        } finally {
-            if (fs.existsSync(tmpFile)) {
-                fs.unlinkSync(tmpFile);
-            }
-        }
-    }
-
-    async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean, overwrite: boolean }): Promise<void> {
-        const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
-        const targetPath = uri.path;
-        
-        const tmpFile = path.join(os.tmpdir(), `adb-fs-push-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
-        try {
-            await fs.promises.writeFile(tmpFile, content);
-            await this.connectionManager.executeCommandForDevice(deviceId, `push "${tmpFile}" "${targetPath}"`);
-            this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Changed, uri }]);
-        } catch (e: any) {
-            throw vscode.FileSystemError.Unavailable(uri);
-        } finally {
-            if (fs.existsSync(tmpFile)) {
-                fs.unlinkSync(tmpFile);
-            }
-        }
-    }
-
-    async createDirectory(uri: vscode.Uri): Promise<void> {
-        const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
-        const targetPath = uri.path;
-        const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const currentUser = await shell.getCurrentUser();
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
-        
-        await shell.executeCommand(`${prefix} mkdir -p "${targetPath}"`);
-        this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Created, uri }]);
-    }
-
-    async delete(uri: vscode.Uri, options: { recursive: boolean }): Promise<void> {
-        const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
-        const targetPath = uri.path;
-        const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const currentUser = await shell.getCurrentUser();
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
-        
-        const rmArgs = options.recursive ? '-rf' : '-f';
-        await shell.executeCommand(`${prefix} rm ${rmArgs} "${targetPath}"`);
-        this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
-    }
-
-    async rename(oldUri: vscode.Uri, newUri: vscode.Uri, options: { overwrite: boolean }): Promise<void> {
-        const deviceId = await this.connectionManager.resolveDeviceId(oldUri.authority);
-        const oldPath = oldUri.path;
-        const newPath = newUri.path;
-        
-        const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const currentUser = await shell.getCurrentUser();
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
-        
-        await shell.executeCommand(`${prefix} mv "${oldPath}" "${newPath}"`);
-        this._onDidChangeFile.fire([
-            { type: vscode.FileChangeType.Deleted, uri: oldUri },
-            { type: vscode.FileChangeType.Created, uri: newUri }
-        ]);
     }
 }

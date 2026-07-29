@@ -43,6 +43,7 @@ export interface ValidationManifest {
         user: string;
         groups: string[];
         isRootAvailable: boolean;
+        switchCommand?: { type: 'root' | 'termux' | 'custom' | 'shell', pkgName?: string };
     };
 }
 
@@ -268,11 +269,12 @@ export class ValidationManager {
                 workspaceRoot: targetPath,
                 fullAccess: finalFullAccess,
                 readOnly: finalReadOnly,
-                skipped: finalSkipped,
+                skipped: Array.from(attemptedPaths).filter(p => !acceptedPaths.has(p)),
                 privilegeContext: {
                     user: currentUser.name,
                     groups: currentUser.groups,
-                    isRootAvailable
+                    isRootAvailable,
+                    switchCommand: shell.activeSwitchCommand
                 }
             };
         });
