@@ -18,7 +18,7 @@ export async function activate(context: vscode.ExtensionContext) {
     const toolsManager = new PlatformToolsManager(context);
     const connectionManager = new ConnectionManager(toolsManager);
     const toyboxManager = new ToyboxManager(toolsManager, context);
-    const cacheManager = new CacheManager(context, connectionManager);
+    const cacheManager = new CacheManager(context, connectionManager, toyboxManager);
 
     const fsProvider = new AdbFileSystemProvider(connectionManager, toyboxManager, cacheManager);
     context.subscriptions.push(vscode.workspace.registerFileSystemProvider('remote-adb', fsProvider, { isCaseSensitive: true }));
@@ -101,7 +101,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // Trigger background cache initialization if manifest exists
         if (manifestToLog) {
             // We do not await this so it runs in the background
-            cacheManager.initializeCache(deviceId, manifestToLog).catch(e => {
+            cacheManager.initializeCache(deviceId, manifestToLog.workspaceRoot).catch(e => {
                 Logger.logError(`[Extension Activate] Cache initialization failed: ${e}`);
             });
         }
