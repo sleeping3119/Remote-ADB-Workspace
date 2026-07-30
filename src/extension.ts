@@ -238,19 +238,33 @@ export async function activate(context: vscode.ExtensionContext) {
                 shell.refreshCurrentUser();
                 user = await shell.getCurrentUser();
                 
+                // Get absolute path
+                let absTargetFolder = targetFolder;
+                if (!absTargetFolder.startsWith('/')) {
+                    const pwdOut = await shell.executeCommand('pwd');
+                    const pwd = pwdOut.trim();
+                    absTargetFolder = absTargetFolder.replace(/^\.\//, '');
+                    absTargetFolder = `${pwd}/${absTargetFolder}`;
+                }
+
+                // Always ensure the target folder exists and has correct permissions
+                if (absTargetFolder.includes('/')) {
+                    const parent = absTargetFolder.substring(0, absTargetFolder.lastIndexOf('/'));
+                    await shell.executeCommand(`mkdir -p ${parent}`);
+                }
+                await shell.executeCommand(`mkdir -p ${absTargetFolder}`);
+                await shell.executeCommand(`chmod 775 ${absTargetFolder}`);
+
+                toyboxManager.setRawFolderPath(deviceId, user.name, absTargetFolder);
+
                 const checkRaw = await shell.executeCommand('ls -A /data/local/tmp/.raw 2>/dev/null');
                 if (checkRaw.trim()) {
-                    const testLocal = await shell.executeCommand(`${targetFolder}/toybox --version`);
+                    const testLocal = await shell.executeCommand(`${absTargetFolder}/toybox --version`);
                     if (testLocal.includes('not found') || testLocal.includes('inaccessible') || testLocal.includes('No such file')) {
-                        if (targetFolder.includes('/')) {
-                            const parent = targetFolder.substring(0, targetFolder.lastIndexOf('/'));
-                            await shell.executeCommand(`mkdir -p ${parent}`);
-                        }
-                        await shell.executeCommand(`mkdir -p ${targetFolder}`);
-                        await shell.executeCommand(`cat /data/local/tmp/.raw/toybox > ${targetFolder}/toybox`);
-                        await shell.executeCommand(`chmod 700 ${targetFolder}/toybox`);
+                        await shell.executeCommand(`cat /data/local/tmp/.raw/toybox > ${absTargetFolder}/toybox`);
+                        await shell.executeCommand(`chmod 700 ${absTargetFolder}/toybox`);
                     }
-                    toyboxManager.setToyboxPrefix(deviceId, user.name, `${targetFolder}/toybox`);
+                    toyboxManager.setToyboxPrefix(deviceId, user.name, `${absTargetFolder}/toybox`);
                 } else {
                     toyboxManager.setToyboxPrefix(deviceId, user.name, 'toybox');
                 }

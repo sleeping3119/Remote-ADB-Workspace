@@ -15,6 +15,7 @@ export class ToyboxManager {
     private context: vscode.ExtensionContext;
     private cachedPrefixes: Map<string, string> = new Map();
     private pendingPrefixes: Map<string, Promise<string>> = new Map();
+    private rawFolderPaths: Map<string, string> = new Map();
 
     constructor(toolsManager: PlatformToolsManager, context: vscode.ExtensionContext) {
         this.toolsManager = toolsManager;
@@ -48,7 +49,25 @@ export class ToyboxManager {
         this.cachedPrefixes.set(key, prefix);
     }
 
+    public getRawFolderPath(deviceId: string, username: string): string {
+        const key = `${deviceId}_${username}`;
+        return this.rawFolderPaths.get(key) || RAW_DIR;
+    }
+
+    public setRawFolderPath(deviceId: string, username: string, path: string): void {
+        const key = `${deviceId}_${username}`;
+        this.rawFolderPaths.set(key, path);
+    }
+
     private async _resolveToyboxPrefix(deviceId: string, username: string): Promise<string> {
+        if (username === 'shell' || username === 'root') {
+            try {
+                await this.execAdb(deviceId, `shell mkdir -p ${RAW_DIR}`);
+                this.setRawFolderPath(deviceId, username, RAW_DIR);
+            } catch (e) {
+                // ignore
+            }
+        }
 
         // 1. Check if natively available
         try {
