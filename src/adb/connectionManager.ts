@@ -18,27 +18,39 @@ export class PersistentAdbShell {
     private commandQueue: { command: string, resolve: (data: string) => void, reject: (err: Error) => void, isRaw?: boolean }[] = [];
     private isBusy = false;
     private currentUser: { name: string, groups: string[] } | null = null;
+    private pendingUserPromise: Promise<{ name: string, groups: string[] }> | null = null;
 
     public async getCurrentUser(forceRefresh: boolean = false): Promise<{ name: string, groups: string[] }> {
         if (this.currentUser && !forceRefresh) return this.currentUser;
         
-        try {
-            // Using 'toybox id' ensures consistent output across devices. 
-            // If toybox isn't in PATH, 'id' is a fallback.
-            const nameStr = await this.executeCommand('toybox id -un 2>/dev/null || id -un');
-            const groupsStr = await this.executeCommand('toybox id -Gn 2>/dev/null || id -Gn');
-            this.currentUser = {
-                name: nameStr.trim(),
-                groups: groupsStr.trim().split(/\s+/)
-            };
-        } catch (e) {
-            this.currentUser = { name: 'shell', groups: ['shell'] };
+        if (this.pendingUserPromise && !forceRefresh) {
+            return this.pendingUserPromise;
         }
-        return this.currentUser;
+
+        this.pendingUserPromise = (async () => {
+            try {
+                // Using 'toybox id' ensures consistent output across devices. 
+                // If toybox isn't in PATH, 'id' is a fallback.
+                const nameStr = await this.executeCommand('toybox id -un 2>/dev/null || id -un');
+                const groupsStr = await this.executeCommand('toybox id -Gn 2>/dev/null || id -Gn');
+                this.currentUser = {
+                    name: nameStr.trim(),
+                    groups: groupsStr.trim().split(/\s+/)
+                };
+            } catch (e) {
+                this.currentUser = { name: 'shell', groups: ['shell'] };
+            } finally {
+                this.pendingUserPromise = null;
+            }
+            return this.currentUser;
+        })();
+
+        return this.pendingUserPromise;
     }
 
     public refreshCurrentUser(): void {
         this.currentUser = null;
+        this.pendingUserPromise = null;
     }
 
     constructor(adbPath: string, deviceId: string) {
@@ -189,13 +201,28 @@ export class ConnectionManager {
         return this.deviceIdMap.get(lower) || idFromUri;
     }
 
+    private pendingShells: Map<string, Promise<PersistentAdbShell>> = new Map();
+
     public async getPersistentShell(deviceId: string): Promise<PersistentAdbShell> {
         const realId = await this.resolveDeviceId(deviceId);
-        if (!this.shells.has(realId)) {
-            const adbPath = await this.toolsManager.getAdbPath();
-            this.shells.set(realId, new PersistentAdbShell(adbPath, realId));
+        if (this.shells.has(realId)) {
+            return this.shells.get(realId)!;
         }
-        return this.shells.get(realId)!;
+
+        if (this.pendingShells.has(realId)) {
+            return this.pendingShells.get(realId)!;
+        }
+
+        const shellPromise = (async () => {
+            const adbPath = await this.toolsManager.getAdbPath();
+            const shell = new PersistentAdbShell(adbPath, realId);
+            this.shells.set(realId, shell);
+            this.pendingShells.delete(realId);
+            return shell;
+        })();
+
+        this.pendingShells.set(realId, shellPromise);
+        return shellPromise;
     }
 
     public getPersistentShellIfExists(deviceId: string): PersistentAdbShell | undefined {

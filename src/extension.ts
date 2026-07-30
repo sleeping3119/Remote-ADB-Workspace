@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { PlatformToolsManager } from './adb/platformToolsManager';
 import { ConnectionManager } from './adb/connectionManager';
 import { ToyboxManager } from './adb/toyboxManager';
+import { CacheManager } from './fs/cacheManager';
 import { AdbFileSystemProvider } from './fs/adbFileSystemProvider';
 import { Logger } from './logger';
 import { DeviceTreeProvider, DeviceTreeItem } from './tree/deviceTreeProvider';
@@ -17,8 +18,9 @@ export async function activate(context: vscode.ExtensionContext) {
     const toolsManager = new PlatformToolsManager(context);
     const connectionManager = new ConnectionManager(toolsManager);
     const toyboxManager = new ToyboxManager(toolsManager, context);
+    const cacheManager = new CacheManager(context, connectionManager);
 
-    const fsProvider = new AdbFileSystemProvider(connectionManager, toyboxManager);
+    const fsProvider = new AdbFileSystemProvider(connectionManager, toyboxManager, cacheManager);
     context.subscriptions.push(vscode.workspace.registerFileSystemProvider('remote-adb', fsProvider, { isCaseSensitive: true }));
 
     const validationManager = new ValidationManager(connectionManager, toyboxManager);
@@ -51,15 +53,16 @@ export async function activate(context: vscode.ExtensionContext) {
         
         let manifestToLog: any = undefined;
         try {
-            const data = await vscode.workspace.fs.readFile(manifestUri);
-            const globalManifest = JSON.parse(new TextDecoder().decode(data));
+            const fs = require('fs');
+            const data = await fs.promises.readFile(manifestUri.fsPath);
+            const globalManifest = JSON.parse(data.toString());
             Logger.logOutput(`[Extension Activate] Found global manifest file. Adopting to workspace state.`);
             manifestToLog = globalManifest;
             
             // Adopt it into local workspace state and clear the file
             context.workspaceState.update('adbValidationManifest', globalManifest);
             try {
-                await vscode.workspace.fs.delete(manifestUri);
+                await fs.promises.unlink(manifestUri.fsPath);
             } catch (e) {
                 // Ignore delete errors
             }
@@ -94,6 +97,15 @@ export async function activate(context: vscode.ExtensionContext) {
         } else {
             Logger.logOutput(`[Extension Activate] No manifest available to log.`);
         }
+        
+        // Trigger background cache initialization if manifest exists
+        if (manifestToLog) {
+            // We do not await this so it runs in the background
+            cacheManager.initializeCache(deviceId, manifestToLog).catch(e => {
+                Logger.logError(`[Extension Activate] Cache initialization failed: ${e}`);
+            });
+        }
+        
         } finally {
             resolveInit();
         }

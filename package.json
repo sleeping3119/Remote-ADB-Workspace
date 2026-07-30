@@ -187,6 +187,8 @@
     "serialize-javascript": "^7.0.6"
   },
   "dependencies": {
-    "adm-zip": "^0.6.0"
+    "@types/tar": "^6.1.13",
+    "adm-zip": "^0.6.0",
+    "tar": "^7.5.22"
   }
 }

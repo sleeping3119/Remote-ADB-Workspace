@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { ConnectionManager } from '../adb/connectionManager';
 import { ToyboxManager } from '../adb/toyboxManager';
+import { CacheManager } from './cacheManager';
 
 export interface AdbDirEntry {
     name: string;
@@ -14,13 +15,15 @@ export interface AdbDirEntry {
 export class AdbFileSystemProvider implements vscode.FileSystemProvider {
     private connectionManager: ConnectionManager;
     private toyboxManager: ToyboxManager;
+    private cacheManager: CacheManager;
     
     private _onDidChangeFile = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
     readonly onDidChangeFile = this._onDidChangeFile.event;
     
-    constructor(connectionManager: ConnectionManager, toyboxManager: ToyboxManager) {
+    constructor(connectionManager: ConnectionManager, toyboxManager: ToyboxManager, cacheManager: CacheManager) {
         this.connectionManager = connectionManager;
         this.toyboxManager = toyboxManager;
+        this.cacheManager = cacheManager;
     }
     
     watch(uri: vscode.Uri, options: { recursive: boolean; excludes: string[]; }): vscode.Disposable {
@@ -82,31 +85,55 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const targetPath = uri.path;
         
         const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const currentUser = await shell.getCurrentUser();
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
-        // toybox ls -1p prints one entry per line, with a trailing '/' for directories
-        const output = await shell.executeCommand(`${prefix} ls -1p "${targetPath}"`);
+        // Native shell tests to resolve symlinks and check permissions. 
+        // Folders must have r_x, files must have r__.
+        const shellCmd = `cd "${targetPath}" 2>/dev/null && ls -1A | while IFS= read -r f; do if [ -d "$f" ]; then [ -r "$f" ] && [ -x "$f" ] && echo "$f/"; elif [ -f "$f" ]; then [ -r "$f" ] && echo "$f"; fi; done`;
+        const output = await shell.executeCommand(shellCmd);
         
-        if (output.includes('No such file')) {
-            throw vscode.FileSystemError.FileNotFound(uri);
+        if (output.includes('No such file') || output.includes('Not a directory') || output.includes('cd: ')) {
+            // cd fails if it doesn't exist or permission denied
+            if (!output.includes('Permission denied')) {
+                throw vscode.FileSystemError.FileNotFound(uri);
+            }
         }
         
         const entries: [string, vscode.FileType][] = [];
         const lines = output.split('\n');
+        const validNames: string[] = [];
         
         for (const line of lines) {
             const trimmed = line.trim();
             if (!trimmed || trimmed === './' || trimmed === '../') continue;
-            if (trimmed.includes('Permission denied')) continue;
+            if (trimmed.includes('Permission denied') || trimmed.includes('cd: ')) continue;
             
-            // Check indicator for directories
+            let name = trimmed;
             if (trimmed.endsWith('/')) {
-                entries.push([trimmed.slice(0, -1), vscode.FileType.Directory]);
+                name = trimmed.slice(0, -1);
+                entries.push([name, vscode.FileType.Directory]);
             } else {
-                entries.push([trimmed, vscode.FileType.File]);
+                entries.push([name, vscode.FileType.File]);
+            }
+            validNames.push(name);
+        }
+        
+        // Check local cache and delete files that aren't in legitimate output
+        // We only do this if we actually succeeded in reading (no "Permission denied" on cd itself)
+        if (!output.includes('Permission denied') && !output.includes('cd: ')) {
+            // we will need the workspaceRoot to sync cache. We can extract it from the path or just pass it
+            // since we don't have manifest directly here, we assume targetPath is within workspaceRoot.
+            // Actually, CacheManager handles mapping. We can just pass the path.
+            // Wait, we need workspaceRoot for CacheManager... it uses it to construct cache paths!
+            // Let's retrieve workspaceRoot from the manifest in workspaceState?
+            // Actually, the simplest way to get workspaceRoot is from the currently active workspace folders.
+            const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => uri.path.startsWith(f.uri.path));
+            if (workspaceFolder) {
+                this.cacheManager.syncLocalCache(deviceId, workspaceFolder.uri.path, targetPath, validNames).catch(e => {
+                    console.error("Cache sync failed:", e);
+                });
             }
         }
+        
         return entries;
     }
 
