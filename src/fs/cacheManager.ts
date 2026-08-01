@@ -244,4 +244,48 @@ exit "$tar_status"
             }
         }
     }
+
+    public async pullFileToCache(deviceId: string, workspaceRoot: string, relativePath: string): Promise<void> {
+        const cacheDir = this.getCacheDir(deviceId, workspaceRoot);
+        const adbPath = await this.connectionManager.toolsManager.getAdbPath();
+        
+        // Escape quotes in path just in case
+        const safeRelPath = relativePath.replace(/"/g, '\\"');
+        
+        const shellCmd = `cd "${workspaceRoot}" && toybox tar chf - "${safeRelPath}" 2>/dev/null`;
+        
+        return vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Downloading ${path.basename(relativePath)}...`,
+            cancellable: true
+        }, (progress, token) => {
+            return new Promise<void>((resolve, reject) => {
+                if (!fs.existsSync(cacheDir)) {
+                    fs.mkdirSync(cacheDir, { recursive: true });
+                }
+                
+                const adbProc = spawn(adbPath, ['-s', deviceId, 'exec-out', shellCmd], {
+                    stdio: ['ignore', 'pipe', 'pipe']
+                });
+                
+                const extractStream = tar.extract({ cwd: cacheDir });
+                
+                token.onCancellationRequested(() => {
+                    adbProc.kill();
+                    reject(new Error("Cancelled"));
+                });
+                
+                adbProc.stdout.pipe(extractStream);
+                
+                extractStream.on('finish', () => resolve());
+                extractStream.on('error', (err) => reject(err));
+                
+                adbProc.on('close', (code) => {
+                    if (code !== 0 && code !== null) {
+                        Logger.logError(`[CacheManager] Single file pull adb exited with code ${code}`);
+                    }
+                });
+            });
+        });
+    }
 }

@@ -39,14 +39,19 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const currentUser = await shell.getCurrentUser();
         const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
-        // Using toybox stat to get FileType (hex mode), Size, and Modification time (seconds since epoch)
-        const output = await shell.executeCommand(`${prefix} stat -c "%f %s %Y" "${targetPath}"`);
+        // Using native shell to check write permission and directory status, then toybox stat
+        const shellCmd = `if [ -w "${targetPath}" ]; then echo "W"; else echo "NW"; fi; if [ -d "${targetPath}" ]; then echo "D"; else echo "ND"; fi; ${prefix} stat -c "%f %s %Y" "${targetPath}" 2>/dev/null`;
+        const output = await shell.executeCommand(shellCmd);
         
-        if (output.includes('No such file') || output.includes('stat: ')) {
+        const lines = output.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        
+        if (lines.length < 3 || lines[2].includes('No such file') || lines[2].includes('stat: ')) {
             throw vscode.FileSystemError.FileNotFound(uri);
         }
         
-        const parts = output.trim().split(' ');
+        const writeStatus = lines[0];
+        const dirStatus = lines[1];
+        const parts = lines[2].split(' ');
         if (parts.length < 3) throw vscode.FileSystemError.FileNotFound(uri);
         
         const modeHex = parts[0];
@@ -56,7 +61,9 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const modeNum = parseInt(modeHex, 16);
         let type = vscode.FileType.Unknown;
         
-        if ((modeNum & 0x4000) === 0x4000) {
+        if ((modeNum & 0xA000) === 0xA000) {
+            type = vscode.FileType.SymbolicLink | (dirStatus === 'D' ? vscode.FileType.Directory : vscode.FileType.File);
+        } else if ((modeNum & 0x4000) === 0x4000) {
             type = vscode.FileType.Directory;
         } else if ((modeNum & 0x8000) === 0x8000) {
             type = vscode.FileType.File;
@@ -71,12 +78,18 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             }
         }
 
-        return {
+        const statObj: vscode.FileStat = {
             type: type,
             ctime: mtime,
             mtime: mtime,
             size: size
         };
+
+        if (writeStatus === 'NW') {
+            statObj.permissions = vscode.FilePermission.Readonly;
+        }
+
+        return statObj;
     }
 
     async readDirectory(uri: vscode.Uri): Promise<[string, vscode.FileType][]> {
@@ -87,8 +100,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const shell = await this.connectionManager.getPersistentShell(deviceId);
         
         // Native shell tests to resolve symlinks and check permissions. 
-        // Folders must have r_x, files must have r__.
-        const shellCmd = `cd "${targetPath}" 2>/dev/null && ls -1A | while IFS= read -r f; do if [ -d "$f" ]; then [ -r "$f" ] && [ -x "$f" ] && echo "$f/"; elif [ -f "$f" ]; then [ -r "$f" ] && echo "$f"; fi; done`;
+        // Folders must have r_x, files must have r__. We append |1 for symlinks or |0 for normal files.
+        const shellCmd = `cd "${targetPath}" 2>/dev/null && ls -1A | while IFS= read -r f; do is_sym="0"; [ -L "$f" ] && is_sym="1"; if [ -d "$f" ]; then [ -r "$f" ] && [ -x "$f" ] && printf "%s/|%s\\n" "$f" "$is_sym"; elif [ -f "$f" ]; then [ -r "$f" ] && printf "%s|%s\\n" "$f" "$is_sym"; fi; done`;
         const output = await shell.executeCommand(shellCmd);
         
         if (output.includes('No such file') || output.includes('Not a directory') || output.includes('cd: ')) {
@@ -103,17 +116,29 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const validNames: string[] = [];
         
         for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed === './' || trimmed === '../') continue;
-            if (trimmed.includes('Permission denied') || trimmed.includes('cd: ')) continue;
+            const cleaned = line.endsWith('\r') ? line.slice(0, -1) : line;
+            if (!cleaned || cleaned === './' || cleaned === '../') continue;
+            if (cleaned.includes('Permission denied') || cleaned.includes('cd: ')) continue;
             
-            let name = trimmed;
-            if (trimmed.endsWith('/')) {
-                name = trimmed.slice(0, -1);
-                entries.push([name, vscode.FileType.Directory]);
+            const parts = cleaned.split('|');
+            if (parts.length < 2) continue; // safety check
+            
+            const isSym = parts.pop() === '1'; // pop removes the last element (the 0 or 1 flag)
+            let name = parts.join('|'); // re-join in case the filename contained '|'
+            
+            let type: vscode.FileType;
+            if (name.endsWith('/')) {
+                name = name.slice(0, -1);
+                type = vscode.FileType.Directory;
             } else {
-                entries.push([name, vscode.FileType.File]);
+                type = vscode.FileType.File;
             }
+            
+            if (isSym) {
+                type = type | vscode.FileType.SymbolicLink;
+            }
+            
+            entries.push([name, type]);
             validNames.push(name);
         }
         
@@ -142,7 +167,47 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         await this.connectionManager.waitForShellReady();
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;
+        const shell = await this.connectionManager.getPersistentShell(deviceId);
         
+        // 1. Check existence and read permissions
+        const checkCmd = `if [ -e "${targetPath}" ]; then if [ -r "${targetPath}" ]; then echo "OK"; else echo "NO_READ"; fi; else echo "NOT_FOUND"; fi`;
+        const checkOutput = (await shell.executeCommand(checkCmd)).trim();
+        
+        if (checkOutput === "NOT_FOUND" || checkOutput === "NO_READ") {
+            // Try to find if it's in cache and delete it
+            const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
+            if (workspaceFolder) {
+                const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceFolder.uri.path);
+                const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
+                const cachedFilePath = path.join(cacheDir, relativePath);
+                if (fs.existsSync(cachedFilePath)) {
+                    fs.unlinkSync(cachedFilePath);
+                }
+            }
+            
+            throw checkOutput === "NOT_FOUND" ? vscode.FileSystemError.FileNotFound(uri) : vscode.FileSystemError.NoPermissions(uri);
+        }
+        
+        // 2. Resolve workspace folder to use cache
+        const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
+        
+        if (workspaceFolder) {
+            const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceFolder.uri.path);
+            const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
+            const cachedFilePath = path.join(cacheDir, relativePath);
+            
+            // Check if it exists in cache
+            if (!fs.existsSync(cachedFilePath)) {
+                // Not in cache, pull using tar
+                await this.cacheManager.pullFileToCache(deviceId, workspaceFolder.uri.path, relativePath);
+            }
+            
+            if (fs.existsSync(cachedFilePath)) {
+                return await fs.promises.readFile(cachedFilePath);
+            }
+        }
+        
+        // 3. Fallback to ADB pull if not in workspace or tar failed to produce the file
         const tmpFile = path.join(os.tmpdir(), `adb-fs-pull-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
         try {
             await this.connectionManager.executeCommandForDevice(deviceId, `pull "${targetPath}" "${tmpFile}"`);
