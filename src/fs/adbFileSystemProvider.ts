@@ -6,6 +6,7 @@ import * as crypto from 'crypto';
 import { ConnectionManager } from '../adb/connectionManager';
 import { ToyboxManager } from '../adb/toyboxManager';
 import { CacheManager } from './cacheManager';
+import { escapePath } from '../utils/shellUtils';
 
 export interface AdbDirEntry {
     name: string;
@@ -40,8 +41,9 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const currentUser = await shell.getCurrentUser();
         const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
+        const safePath = escapePath(targetPath);
         // Using native shell to check write permission and directory status, then toybox stat
-        const shellCmd = `if [ -w "${targetPath}" ]; then echo "W"; else echo "NW"; fi; if [ -d "${targetPath}" ]; then echo "D"; else echo "ND"; fi; ${prefix} stat -c "%f %s %Y" "${targetPath}" 2>/dev/null`;
+        const shellCmd = `if [ -w "${safePath}" ]; then echo "W"; else echo "NW"; fi; if [ -d "${safePath}" ]; then echo "D"; else echo "ND"; fi; ${prefix} stat -c "%f %s %Y" "${safePath}" 2>/dev/null`;
         const output = await shell.executeCommand(shellCmd);
         
         const lines = output.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
@@ -100,9 +102,10 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         
         const shell = await this.connectionManager.getPersistentShell(deviceId);
         
+        const safePath = escapePath(targetPath);
         // Native shell tests to resolve symlinks and check permissions. 
         // Folders must have r_x, files must have r__. We append |1 for symlinks or |0 for normal files.
-        const shellCmd = `cd "${targetPath}" 2>/dev/null && ls -1A | while IFS= read -r f; do is_sym="0"; [ -L "$f" ] && is_sym="1"; if [ -d "$f" ]; then [ -r "$f" ] && [ -x "$f" ] && printf "%s/|%s\\n" "$f" "$is_sym"; elif [ -f "$f" ]; then [ -r "$f" ] && printf "%s|%s\\n" "$f" "$is_sym"; fi; done`;
+        const shellCmd = `cd "${safePath}" 2>/dev/null && ls -1A | while IFS= read -r f; do is_sym="0"; [ -L "$f" ] && is_sym="1"; if [ -d "$f" ]; then [ -r "$f" ] && [ -x "$f" ] && printf "%s/|%s\\n" "$f" "$is_sym"; elif [ -f "$f" ]; then [ -r "$f" ] && printf "%s|%s\\n" "$f" "$is_sym"; fi; done`;
         const output = await shell.executeCommand(shellCmd);
         
         if (output.includes('No such file') || output.includes('Not a directory') || output.includes('cd: ')) {
@@ -146,12 +149,6 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         // Check local cache and delete files that aren't in legitimate output
         // We only do this if we actually succeeded in reading (no "Permission denied" on cd itself)
         if (!output.includes('Permission denied') && !output.includes('cd: ')) {
-            // we will need the workspaceRoot to sync cache. We can extract it from the path or just pass it
-            // since we don't have manifest directly here, we assume targetPath is within workspaceRoot.
-            // Actually, CacheManager handles mapping. We can just pass the path.
-            // Wait, we need workspaceRoot for CacheManager... it uses it to construct cache paths!
-            // Let's retrieve workspaceRoot from the manifest in workspaceState?
-            // Actually, the simplest way to get workspaceRoot is from the currently active workspace folders.
             const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => uri.path.startsWith(f.uri.path));
             if (workspaceFolder) {
                 this.cacheManager.syncLocalCache(deviceId, workspaceFolder.uri.path, targetPath, validNames).catch(e => {
@@ -173,8 +170,9 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const currentUser = await shell.getCurrentUser();
         const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
 
+        const safePath = escapePath(targetPath);
         // 1. Check existence and read permissions, and fetch remote mtime/size
-        const checkCmd = `if [ -e "${targetPath}" ]; then if [ -r "${targetPath}" ]; then ${prefix} stat -c "OK|%Y|%s" "${targetPath}"; else echo "NO_READ"; fi; else echo "NOT_FOUND"; fi`;
+        const checkCmd = `if [ -e "${safePath}" ]; then if [ -r "${safePath}" ]; then ${prefix} stat -c "OK|%Y|%s" "${safePath}"; else echo "NO_READ"; fi; else echo "NOT_FOUND"; fi`;
         const checkOutput = (await shell.executeCommand(checkCmd)).trim();
         
         const outputLines = checkOutput.split(/\r?\n/).filter(Boolean);
@@ -263,7 +261,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         // 3. Fallback to ADB pull directly into local cache file
         try {
             await fs.promises.mkdir(path.dirname(cachedFilePath), { recursive: true });
-            await this.connectionManager.executeCommandForDevice(deviceId, `pull "${targetPath}" "${cachedFilePath}"`);
+            await this.connectionManager.executeCommandForDevice(deviceId, `pull "${escapePath(targetPath)}" "${escapePath(cachedFilePath)}"`);
             return await fs.promises.readFile(cachedFilePath);
         } catch (e: any) {
             throw vscode.FileSystemError.FileNotFound(uri);
@@ -276,11 +274,14 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const targetPath = uri.path;
         const shell = await this.connectionManager.getPersistentShell(deviceId);
         
+        const safeTargetPath = escapePath(targetPath);
+        
         // Atomic creation step
         if (options.create) {
             const parentPath = path.posix.dirname(targetPath);
+            const safeParentPath = escapePath(parentPath);
             // Only check parent write permissions and touch if the file doesn't already exist.
-            const cmd = `if [ -e "${targetPath}" ]; then echo "EXISTS"; elif [ ! -w "${parentPath}" ]; then echo "NO_WRITE"; else touch "${targetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
+            const cmd = `if [ -e "${safeTargetPath}" ]; then echo "EXISTS"; elif [ ! -w "${safeParentPath}" ]; then echo "NO_WRITE"; else touch "${safeTargetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
             const output = (await shell.executeCommand(cmd)).trim();
             
             if (output.startsWith("NO_WRITE")) {
@@ -322,7 +323,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                 const currentUser = await shell.getCurrentUser();
                 const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
                 
-                const md5Cmd = `if [ -f "${targetPath}" ]; then ${prefix} md5sum "${targetPath}" | cut -d' ' -f1; else echo "NOT_FOUND"; fi`;
+                const md5Cmd = `if [ -f "${safeTargetPath}" ]; then ${prefix} md5sum "${safeTargetPath}" | cut -d' ' -f1; else echo "NOT_FOUND"; fi`;
                 const remoteHashOutput = (await shell.executeCommand(md5Cmd)).trim().split(/\r?\n/).pop() || "NOT_FOUND";
                 
                 if (remoteHashOutput !== "NOT_FOUND" && remoteHashOutput !== baseline.md5) {
@@ -365,9 +366,12 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                 const tempRawFileName = 'push_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
                 const tempRawPath = path.posix.join(rawFolder, tempRawFileName);
                 
-                await this.connectionManager.executeCommandForDevice(deviceId, `push "${cachedFilePath}" "${tempRawPath}"`);
+                const safeCachedFile = escapePath(cachedFilePath);
+                const safeTempRawPath = escapePath(tempRawPath);
                 
-                const catCmd = `cat "${tempRawPath}" > "${targetPath}" 2>&1 && rm -f "${tempRawPath}" && echo "OK" || echo "ERR:$?"`;
+                await this.connectionManager.executeCommandForDevice(deviceId, `push "${safeCachedFile}" "${safeTempRawPath}"`);
+                
+                const catCmd = `cat "${safeTempRawPath}" > "${safeTargetPath}" 2>&1 && rm -f "${safeTempRawPath}" && echo "OK" || echo "ERR:$?"`;
                 const catOutput = (await shell.executeCommand(catCmd)).trim();
                 
                 if (!catOutput.endsWith("OK")) {
@@ -378,7 +382,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                 if (workspaceFolder) {
                     const currentUser = await shell.getCurrentUser();
                     const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
-                    const statCmd = `${prefix} stat -c "%Y %s" "${targetPath}"`;
+                    const statCmd = `${prefix} stat -c "%Y %s" "${safeTargetPath}"`;
                     const statOutput = (await shell.executeCommand(statCmd)).trim().split(/\r?\n/).pop() || "";
                     const statParts = statOutput.split(' ');
                     if (statParts.length === 2) {
@@ -409,7 +413,9 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const shell = await this.connectionManager.getPersistentShell(deviceId);
         
         const parentPath = path.posix.dirname(targetPath);
-        const cmd = `if [ ! -w "${parentPath}" ]; then echo "NO_WRITE"; else mkdir -p "${targetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
+        const safeTargetPath = escapePath(targetPath);
+        const safeParentPath = escapePath(parentPath);
+        const cmd = `if [ ! -w "${safeParentPath}" ]; then echo "NO_WRITE"; else mkdir -p "${safeTargetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
         const output = (await shell.executeCommand(cmd)).trim();
         
         if (output.startsWith("NO_WRITE")) {
@@ -440,7 +446,9 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         
         const parentPath = path.posix.dirname(targetPath);
         const rmArgs = options.recursive ? '-rf' : '-f';
-        const cmd = `if [ ! -w "${parentPath}" ]; then echo "NO_WRITE"; else ${prefix} rm ${rmArgs} "${targetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
+        const safeTargetPath = escapePath(targetPath);
+        const safeParentPath = escapePath(parentPath);
+        const cmd = `if [ ! -w "${safeParentPath}" ]; then echo "NO_WRITE"; else ${prefix} rm ${rmArgs} "${safeTargetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
         const output = (await shell.executeCommand(cmd)).trim();
         
         if (output.startsWith("NO_WRITE")) {
@@ -492,8 +500,13 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const oldParentPath = path.posix.dirname(oldPath);
         const newParentPath = path.posix.dirname(newPath);
         
+        const safeOldPath = escapePath(oldPath);
+        const safeNewPath = escapePath(newPath);
+        const safeOldParent = escapePath(oldParentPath);
+        const safeNewParent = escapePath(newParentPath);
+
         // Check permissions on both the source parent and destination parent
-        const cmd = `if [ ! -w "${oldParentPath}" ] || [ ! -w "${newParentPath}" ]; then echo "NO_WRITE"; else ${prefix} mv "${oldPath}" "${newPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
+        const cmd = `if [ ! -w "${safeOldParent}" ] || [ ! -w "${safeNewParent}" ]; then echo "NO_WRITE"; else ${prefix} mv "${safeOldPath}" "${safeNewPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
         const output = (await shell.executeCommand(cmd)).trim();
         
         if (output.startsWith("NO_WRITE")) {
@@ -563,9 +576,10 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const currentUser = await shell.getCurrentUser();
         const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
+        const safePath = escapePath(targetPath);
         // toybox ls -l prints detailed format. We filter for directories 'd' and symlinks 'l'
         // Using sed to drop total lines or errors if they slip through, but grep '^[dl]' handles it mostly.
-        const output = await shell.executeCommand(`${prefix} ls -l "${targetPath}" | ${prefix} grep '^[dl]'`);
+        const output = await shell.executeCommand(`${prefix} ls -l "${safePath}" | ${prefix} grep '^[dl]'`);
         
         if (output.includes('Permission denied')) {
             throw vscode.FileSystemError.NoPermissions(uri);
@@ -581,9 +595,6 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             const trimmed = line.trim();
             if (!trimmed) continue;
             
-            // Format: drwxr-xr-x 2 shell shell 4096 2024-01-01 12:00 name
-            // Note: number of links or size might vary, but we can split by whitespace
-            // We use a regex to handle variable whitespace
             const parts = trimmed.split(/\s+/);
             if (parts.length < 7) continue;
             
@@ -591,20 +602,9 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             const owner = parts[2];
             const group = parts[3];
             
-            // Reconstruct name because it might contain spaces
-            // The time is usually at index 5 and 6 (Date Time) or index 6 and 7.
-            // Let's just find the first index that contains a colon (like 12:00) 
-            // or we can slice based on known fixed counts. Usually ls -l has 8 columns before name.
-            // Actually, Android ls -l format:
-            // drwxr-x--- 2 root shell 4096 2023-11-01 10:10 my folder
-            // 0:perms 1:links 2:owner 3:group 4:size 5:date 6:time 7+:name
-            // Wait, symlinks have "name -> target".
             let nameIndex = 7;
             if (parts[6] && !parts[6].includes(':') && !parts[5].includes(':')) {
-                // If it's something different, we might just look for the first part after the time string.
-                // A safer way is to just assume nameIndex = 7 for toybox ls -l
             }
-            // Safer parsing: find the part with a colon (time)
             for (let i = 4; i < parts.length; i++) {
                 if (parts[i].includes(':')) {
                     nameIndex = i + 1;
@@ -614,7 +614,6 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             
             let name = parts.slice(nameIndex).join(' ');
             
-            // If symlink, extract just the link name
             if (perms[0] === 'l' && name.includes(' -> ')) {
                 name = name.split(' -> ')[0];
             }
@@ -637,9 +636,10 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         
         const shell = await this.connectionManager.getPersistentShell(deviceId);
         
+        const safePath = escapePath(targetPath);
         // Use the shell builtin '[' instead of 'toybox test'. The shell builtin correctly 
         // evaluates Android MAC (SELinux) permissions, whereas the toybox binary often gives false positives.
-        const output = await shell.executeCommand(`[ -d "${targetPath}" ] && [ -r "${targetPath}" ] && [ -x "${targetPath}" ] && echo "OK"`);
+        const output = await shell.executeCommand(`[ -d "${safePath}" ] && [ -r "${safePath}" ] && [ -x "${safePath}" ] && echo "OK"`);
         
         return output.trim() === 'OK';
     }

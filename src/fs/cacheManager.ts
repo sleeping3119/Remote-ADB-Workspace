@@ -7,6 +7,7 @@ import * as crypto from 'crypto';
 import { Logger } from '../logger';
 import { ConnectionManager } from '../adb/connectionManager';
 import { ToyboxManager } from '../adb/toyboxManager';
+import { escapePath } from '../utils/shellUtils';
 
 export interface FileBaseline {
     md5: string;
@@ -115,10 +116,14 @@ export class CacheManager {
         const statusFile = `${rawFolder}/.${runId}_status`;
         const errorFile = `${rawFolder}/.${runId}_errors`;
         
+        const safeWorkspaceRoot = escapePath(workspaceRoot);
+        const safeStatusFile = escapePath(statusFile);
+        const safeErrorFile = escapePath(errorFile);
+        
         Logger.logOutput(`[CacheManager] Estimating total files for progress tracking...`);
         let totalFiles = 0;
         try {
-            const findOutput = await shell.executeCommand(`cd "${workspaceRoot}" && toybox find . 2>/dev/null | toybox wc -l`);
+            const findOutput = await shell.executeCommand(`cd "${safeWorkspaceRoot}" && toybox find . 2>/dev/null | toybox wc -l`);
             totalFiles = parseInt(findOutput.trim(), 10);
             if (isNaN(totalFiles)) totalFiles = 0;
         } catch (e) {
@@ -126,11 +131,11 @@ export class CacheManager {
         }
         
         const shellCmd = `
-cd "${workspaceRoot}" || { printf 'FATAL_CD\\n' > "${statusFile}"; exit 100; }
-rm -f "${statusFile}" "${errorFile}"
-toybox tar chf - . 2>"${errorFile}"
+cd "${safeWorkspaceRoot}" || { printf 'FATAL_CD\\n' > "${safeStatusFile}"; exit 100; }
+rm -f "${safeStatusFile}" "${safeErrorFile}"
+toybox tar chf - . 2>"${safeErrorFile}"
 tar_status=$?
-printf 'COMPLETE\\nEXIT=%s\\n' "$tar_status" > "${statusFile}"
+printf 'COMPLETE\\nEXIT=%s\\n' "$tar_status" > "${safeStatusFile}"
 exit "$tar_status"
 `.trim();
         
@@ -250,11 +255,11 @@ exit "$tar_status"
                         const shell = await this.connectionManager.getPersistentShell(deviceId);
                         
                         // Read both status and error files
-                        const statusOutput = await shell.executeCommand(`cat "${statusFile}" 2>/dev/null`);
-                        const errorOutput = await shell.executeCommand(`cat "${errorFile}" 2>/dev/null`);
+                        const statusOutput = await shell.executeCommand(`cat "${safeStatusFile}" 2>/dev/null`);
+                        const errorOutput = await shell.executeCommand(`cat "${safeErrorFile}" 2>/dev/null`);
                         
                         // Clean up temp files
-                        await shell.executeCommand(`rm -f "${statusFile}" "${errorFile}"`);
+                        await shell.executeCommand(`rm -f "${safeStatusFile}" "${safeErrorFile}"`);
                         
                         const statusLines = statusOutput.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
                         
@@ -363,10 +368,10 @@ exit "$tar_status"
         const cacheDir = this.getCacheDir(deviceId, workspaceRoot);
         const adbPath = await this.connectionManager.toolsManager.getAdbPath();
         
-        // Escape quotes in path just in case
-        const safeRelPath = relativePath.replace(/"/g, '\\"');
+        const safeWorkspaceRoot = escapePath(workspaceRoot);
+        const safeRelPath = escapePath(relativePath);
         
-        const shellCmd = `cd "${workspaceRoot}" && toybox tar chf - "${safeRelPath}" 2>/dev/null`;
+        const shellCmd = `cd "${safeWorkspaceRoot}" && toybox tar chf - "${safeRelPath}" 2>/dev/null`;
         
         return vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
