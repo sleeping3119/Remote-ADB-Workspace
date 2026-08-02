@@ -3,12 +3,21 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as tar from 'tar';
 import { spawn } from 'child_process';
+import * as crypto from 'crypto';
 import { Logger } from '../logger';
 import { ConnectionManager } from '../adb/connectionManager';
 import { ToyboxManager } from '../adb/toyboxManager';
 
+export interface FileBaseline {
+    md5: string;
+    mtime: number;
+    size: number;
+}
+
 export class CacheManager {
     private cacheRoot: string;
+    private manifests: Map<string, Record<string, FileBaseline>> = new Map();
+
     
     constructor(private context: vscode.ExtensionContext, private connectionManager: ConnectionManager, private toyboxManager: ToyboxManager) {
         // Use workspace storage if available, otherwise fallback to global storage
@@ -21,6 +30,61 @@ export class CacheManager {
         const sanitizedDeviceId = deviceId.replace(/[/\\:*?"<>|]/g, '_');
         const sanitizedRoot = normalizedRoot.replace(/[/\\:*?"<>|]/g, '_');
         return path.join(this.cacheRoot, sanitizedDeviceId, sanitizedRoot);
+    }
+
+    private getManifestPath(deviceId: string, workspaceRoot: string): string {
+        return path.join(this.getCacheDir(deviceId, workspaceRoot), '.manifest.json');
+    }
+
+    private loadManifest(deviceId: string, workspaceRoot: string): Record<string, FileBaseline> {
+        const manifestPath = this.getManifestPath(deviceId, workspaceRoot);
+        const key = `${deviceId}:${workspaceRoot}`;
+        if (this.manifests.has(key)) {
+            return this.manifests.get(key)!;
+        }
+        try {
+            if (fs.existsSync(manifestPath)) {
+                const data = fs.readFileSync(manifestPath, 'utf8');
+                const manifest = JSON.parse(data);
+                this.manifests.set(key, manifest);
+                return manifest;
+            }
+        } catch (e) {
+            Logger.logError(`[CacheManager] Failed to load manifest: ${e}`);
+        }
+        const empty = {};
+        this.manifests.set(key, empty);
+        return empty;
+    }
+
+    private saveManifest(deviceId: string, workspaceRoot: string) {
+        const manifestPath = this.getManifestPath(deviceId, workspaceRoot);
+        const key = `${deviceId}:${workspaceRoot}`;
+        const manifest = this.manifests.get(key) || {};
+        try {
+            fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+        } catch (e) {
+            Logger.logError(`[CacheManager] Failed to save manifest: ${e}`);
+        }
+    }
+
+    public getBaseline(deviceId: string, workspaceRoot: string, relativePath: string): FileBaseline | undefined {
+        const manifest = this.loadManifest(deviceId, workspaceRoot);
+        return manifest[relativePath];
+    }
+
+    public updateBaseline(deviceId: string, workspaceRoot: string, relativePath: string, baseline: FileBaseline) {
+        const manifest = this.loadManifest(deviceId, workspaceRoot);
+        manifest[relativePath] = baseline;
+        this.saveManifest(deviceId, workspaceRoot);
+    }
+
+    public removeBaseline(deviceId: string, workspaceRoot: string, relativePath: string) {
+        const manifest = this.loadManifest(deviceId, workspaceRoot);
+        if (manifest[relativePath]) {
+            delete manifest[relativePath];
+            this.saveManifest(deviceId, workspaceRoot);
+        }
     }
 
     public async initializeCache(deviceId: string, workspaceRoot: string): Promise<void> {
@@ -87,10 +151,47 @@ exit "$tar_status"
                 let extractedCount = 0;
                 let lastReportTime = Date.now();
                 let reportedPercent = 0;
+                let inFlightPath: string | null = null;
+                
+                const cleanupInFlight = () => {
+                    if (inFlightPath) {
+                        const suspectFile = path.join(cacheDir, inFlightPath);
+                        Logger.logOutput(`[CacheManager] Cleaning up in-flight truncated file: ${suspectFile}`);
+                        try {
+                            if (fs.existsSync(suspectFile)) {
+                                fs.unlinkSync(suspectFile);
+                            }
+                        } catch (e) {
+                            Logger.logError(`[CacheManager] Failed to remove in-flight file ${suspectFile}: ${e}`);
+                        }
+                        inFlightPath = null;
+                    }
+                };
+
+                const notifyInterrupted = (reason: string) => {
+                    vscode.window.showWarningMessage(
+                        `Workspace cache initialization was ${reason}. On-demand file loading over ADB will be used, which may take extra time when opening files.`,
+                        "Retry Cache Sync"
+                    ).then(selection => {
+                        if (selection === "Retry Cache Sync") {
+                            this.context.workspaceState.update(stateKey, false);
+                            this.initializeCache(deviceId, workspaceRoot).catch(e => {
+                                Logger.logError(`[CacheManager] Retry cache initialization failed: ${e}`);
+                            });
+                        }
+                    });
+                };
                 
                 const extractStream = tar.extract({ 
                     cwd: cacheDir,
                     onentry: (entry) => {
+                        inFlightPath = entry.path;
+                        entry.on('end', () => {
+                            if (inFlightPath === entry.path) {
+                                inFlightPath = null;
+                            }
+                        });
+
                         extractedCount++;
                         const now = Date.now();
                         
@@ -117,8 +218,10 @@ exit "$tar_status"
                 
                 token.onCancellationRequested(() => {
                     Logger.logOutput(`[CacheManager] Caching cancelled by user.`);
+                    cleanupInFlight();
                     adbProc.kill();
                     this.context.workspaceState.update(stateKey, false);
+                    notifyInterrupted("cancelled");
                     reject(new Error("Cancelled"));
                 });
                 
@@ -130,12 +233,15 @@ exit "$tar_status"
                 let streamFinished = false;
                 extractStream.on('finish', () => {
                     Logger.logOutput(`[CacheManager] Cache extraction stream finished.`);
+                    inFlightPath = null;
                     streamFinished = true;
                 });
                 
                 extractStream.on('error', (err) => {
                     Logger.logError(`[CacheManager] Tar extraction error: ${err.message}`);
+                    cleanupInFlight();
                     this.context.workspaceState.update(stateKey, false);
+                    notifyInterrupted("interrupted due to an extraction error");
                     reject(err);
                 });
                 
@@ -155,6 +261,7 @@ exit "$tar_status"
                         if (statusLines.includes('FATAL_CD')) {
                             Logger.logError(`[CacheManager] FATAL: could not cd into "${workspaceRoot}" on device.`);
                             this.context.workspaceState.update(stateKey, false);
+                            cleanupInFlight();
                             await fs.promises.rm(cacheDir, { recursive: true, force: true });
                             reject(new Error(`Failed to access workspace root ${workspaceRoot}`));
                             return;
@@ -170,6 +277,7 @@ exit "$tar_status"
                                 Logger.logError(`[CacheManager] Errors captured before failure:\n${errorOutput}`);
                             }
                             this.context.workspaceState.update(stateKey, false);
+                            cleanupInFlight();
                             await fs.promises.rm(cacheDir, { recursive: true, force: true });
                             reject(new Error(`Remote tar command abruptly failed (adb code ${adbExitCode})`));
                             return;
@@ -210,12 +318,14 @@ exit "$tar_status"
                         } else {
                             Logger.logError(`[CacheManager] Remote tar failed with exit code ${remoteTarExitCode}. Unattributed errors:\n${otherErrors.join('\n')}`);
                             this.context.workspaceState.update(stateKey, false);
+                            cleanupInFlight();
                             await fs.promises.rm(cacheDir, { recursive: true, force: true });
                             reject(new Error(`Remote tar failed with code ${remoteTarExitCode}`));
                         }
                     } catch (e) {
                         Logger.logError(`[CacheManager] Failed to retrieve remote tar status: ${e}`);
                         this.context.workspaceState.update(stateKey, false);
+                        cleanupInFlight();
                         await fs.promises.rm(cacheDir, { recursive: true, force: true });
                         reject(e);
                     }
@@ -234,11 +344,14 @@ exit "$tar_status"
         const validSet = new Set(validRemoteEntries);
         
         for (const localEntry of localEntries) {
+            if (localEntry === '.manifest.json') continue;
             if (!validSet.has(localEntry)) {
                 const fullPath = path.join(localPath, localEntry);
                 Logger.logOutput(`[CacheManager] Deleting local cache file not found on remote: ${fullPath}`);
                 try {
                     await fs.promises.rm(fullPath, { recursive: true, force: true });
+                    const rel = relPath ? path.posix.join(relPath, localEntry) : localEntry;
+                    this.removeBaseline(deviceId, workspaceRoot, rel);
                 } catch (e) {
                     Logger.logError(`[CacheManager] Failed to delete ${fullPath}: ${e}`);
                 }
@@ -272,15 +385,43 @@ exit "$tar_status"
                 
                 const extractStream = tar.extract({ cwd: cacheDir });
                 
+                const cleanupFile = () => {
+                    const filePath = path.join(cacheDir, relativePath);
+                    if (fs.existsSync(filePath)) {
+                        try { fs.unlinkSync(filePath); } catch (e) {}
+                    }
+                };
+
                 token.onCancellationRequested(() => {
                     adbProc.kill();
+                    cleanupFile();
                     reject(new Error("Cancelled"));
                 });
                 
                 adbProc.stdout.pipe(extractStream);
                 
-                extractStream.on('finish', () => resolve());
-                extractStream.on('error', (err) => reject(err));
+                extractStream.on('finish', async () => {
+                    try {
+                        const filePath = path.join(cacheDir, relativePath);
+                        if (fs.existsSync(filePath)) {
+                            const stat = await fs.promises.stat(filePath);
+                            const content = await fs.promises.readFile(filePath);
+                            const hash = crypto.createHash('md5').update(content).digest('hex');
+                            this.updateBaseline(deviceId, workspaceRoot, relativePath, {
+                                md5: hash,
+                                mtime: Math.floor(stat.mtimeMs),
+                                size: stat.size
+                            });
+                        }
+                    } catch (e) {
+                        Logger.logError(`[CacheManager] Failed to update baseline for ${relativePath}: ${e}`);
+                    }
+                    resolve();
+                });
+                extractStream.on('error', (err) => {
+                    cleanupFile();
+                    reject(err);
+                });
                 
                 adbProc.on('close', (code) => {
                     if (code !== 0 && code !== null) {

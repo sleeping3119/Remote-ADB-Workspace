@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 import { ConnectionManager } from '../adb/connectionManager';
 import { ToyboxManager } from '../adb/toyboxManager';
 import { CacheManager } from './cacheManager';
@@ -169,11 +170,17 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const targetPath = uri.path;
         const shell = await this.connectionManager.getPersistentShell(deviceId);
         
-        // 1. Check existence and read permissions
-        const checkCmd = `if [ -e "${targetPath}" ]; then if [ -r "${targetPath}" ]; then echo "OK"; else echo "NO_READ"; fi; else echo "NOT_FOUND"; fi`;
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+
+        // 1. Check existence and read permissions, and fetch remote mtime/size
+        const checkCmd = `if [ -e "${targetPath}" ]; then if [ -r "${targetPath}" ]; then ${prefix} stat -c "OK|%Y|%s" "${targetPath}"; else echo "NO_READ"; fi; else echo "NOT_FOUND"; fi`;
         const checkOutput = (await shell.executeCommand(checkCmd)).trim();
         
-        if (checkOutput === "NOT_FOUND" || checkOutput === "NO_READ") {
+        const outputLines = checkOutput.split(/\r?\n/).filter(Boolean);
+        const lastLine = outputLines[outputLines.length - 1] || "NOT_FOUND";
+
+        if (lastLine === "NOT_FOUND" || lastLine === "NO_READ") {
             // Try to find if it's in cache and delete it
             const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
             if (workspaceFolder) {
@@ -183,9 +190,10 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                 if (fs.existsSync(cachedFilePath)) {
                     fs.unlinkSync(cachedFilePath);
                 }
+                this.cacheManager.removeBaseline(deviceId, workspaceFolder.uri.path, relativePath);
             }
             
-            throw checkOutput === "NOT_FOUND" ? vscode.FileSystemError.FileNotFound(uri) : vscode.FileSystemError.NoPermissions(uri);
+            throw lastLine === "NOT_FOUND" ? vscode.FileSystemError.FileNotFound(uri) : vscode.FileSystemError.NoPermissions(uri);
         }
         
         // 2. Resolve workspace folder to use cache
@@ -196,6 +204,51 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             ? targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '')
             : targetPath.replace(/^\/+/, '');
         const cachedFilePath = path.join(cacheDir, relativePath);
+
+        const parts = lastLine.split('|');
+        if (parts[0] === 'OK' && parts.length === 3) {
+            // stat "%Y" is epoch seconds. Cache mtime is stored from local stat, which is epoch ms, 
+            // but we can just normalize both to seconds for comparison to be safe, or just compare roughly.
+            // Wait, we stored `Math.floor(stat.mtimeMs)` in cacheManager. Let's compare seconds.
+            const remoteMtimeSecs = parseInt(parts[1], 10);
+            const remoteSize = parseInt(parts[2], 10);
+            
+            let baseline = this.cacheManager.getBaseline(deviceId, workspaceRoot, relativePath);
+            
+            // Lazily establish baseline if the file was populated by initializeCache (tar)
+            if (!baseline && fs.existsSync(cachedFilePath)) {
+                const localStat = await fs.promises.stat(cachedFilePath);
+                const localMtimeSecs = Math.floor(localStat.mtimeMs / 1000);
+                
+                if (localMtimeSecs === remoteMtimeSecs && localStat.size === remoteSize) {
+                    const content = await fs.promises.readFile(cachedFilePath);
+                    const hash = crypto.createHash('md5').update(content).digest('hex');
+                    baseline = {
+                        md5: hash,
+                        mtime: Math.floor(localStat.mtimeMs),
+                        size: localStat.size
+                    };
+                    this.cacheManager.updateBaseline(deviceId, workspaceRoot, relativePath, baseline);
+                }
+            }
+
+            if (baseline) {
+                const baselineMtimeSecs = Math.floor(baseline.mtime / 1000);
+                // Due to local extraction, mtime might be slightly off. Actually, Android filesystem 
+                // might have different resolution. We primarily care about size or significant mtime changes.
+                // It's safest to invalidate if they don't match, as pulling is cheap.
+                if (baselineMtimeSecs !== remoteMtimeSecs || baseline.size !== remoteSize) {
+                    if (fs.existsSync(cachedFilePath)) {
+                        fs.unlinkSync(cachedFilePath);
+                    }
+                    this.cacheManager.removeBaseline(deviceId, workspaceRoot, relativePath);
+                }
+            } else if (fs.existsSync(cachedFilePath)) {
+                // No baseline and local stat didn't match remote stat, it means it changed 
+                // remotely after initializeCache extracted it. It's stale!
+                fs.unlinkSync(cachedFilePath);
+            }
+        }
 
         // Check if it exists in cache
         if (!fs.existsSync(cachedFilePath) && workspaceFolder) {
@@ -226,25 +279,28 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         // Atomic creation step
         if (options.create) {
             const parentPath = path.posix.dirname(targetPath);
-            const cmd = `if [ ! -w "${parentPath}" ]; then echo "NO_WRITE"; else touch "${targetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
+            // Only check parent write permissions and touch if the file doesn't already exist.
+            const cmd = `if [ -e "${targetPath}" ]; then echo "EXISTS"; elif [ ! -w "${parentPath}" ]; then echo "NO_WRITE"; else touch "${targetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
             const output = (await shell.executeCommand(cmd)).trim();
             
             if (output.startsWith("NO_WRITE")) {
                 throw vscode.FileSystemError.NoPermissions(`'${path.posix.basename(parentPath)}' folder has no write permission. You can only modify existing files in it.`);
             }
             
-            if (!output.endsWith("OK")) {
+            if (!output.endsWith("OK") && !output.endsWith("EXISTS")) {
                 throw vscode.FileSystemError.Unavailable(`Failed to create file: ${output.replace('ERR', '').trim()}`);
             }
             
-            // Sync structure using tar immediately before any reads can happen
-            const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
-            if (workspaceFolder) {
-                const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
-                await this.cacheManager.pullFileToCache(deviceId, workspaceFolder.uri.path, relativePath);
+            if (output.endsWith("OK")) {
+                // Sync structure using tar immediately before any reads can happen
+                const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
+                if (workspaceFolder) {
+                    const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
+                    await this.cacheManager.pullFileToCache(deviceId, workspaceFolder.uri.path, relativePath);
+                }
+                
+                this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Created, uri }]);
             }
-            
-            this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Created, uri }]);
         }
         
         // Resolve cache file path
@@ -255,6 +311,47 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             ? targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '')
             : targetPath.replace(/^\/+/, '');
         const cachedFilePath = path.join(cacheDir, relativePath);
+        
+        // Calculate local hash of the new content being saved
+        const localHash = crypto.createHash('md5').update(content).digest('hex');
+
+        // OPTIMISTIC CONCURRENCY CONTROL
+        if (!options.create && workspaceFolder) {
+            const baseline = this.cacheManager.getBaseline(deviceId, workspaceRoot, relativePath);
+            if (baseline) {
+                const currentUser = await shell.getCurrentUser();
+                const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+                
+                const md5Cmd = `if [ -f "${targetPath}" ]; then ${prefix} md5sum "${targetPath}" | cut -d' ' -f1; else echo "NOT_FOUND"; fi`;
+                const remoteHashOutput = (await shell.executeCommand(md5Cmd)).trim().split(/\r?\n/).pop() || "NOT_FOUND";
+                
+                if (remoteHashOutput !== "NOT_FOUND" && remoteHashOutput !== baseline.md5) {
+                    if (localHash !== baseline.md5) {
+                        const choice = await vscode.window.showWarningMessage(
+                            "The file on your Android device was modified while you also had changes on your computer.\n\nYou have two options:\n\n1. **Sync from Android** — your local changes on the computer will be lost and replaced with the newer file from the device.\n2. **Force your changes to Android** — your computer's version will overwrite the current file on the device.\n\nChoose carefully, because one version will replace the other.",
+                            { modal: true },
+                            "Sync from Android",
+                            "Force your changes to Android"
+                        );
+
+                        if (choice === "Sync from Android") {
+                            await this.cacheManager.pullFileToCache(deviceId, workspaceRoot, relativePath);
+                            this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Changed, uri }]);
+                            throw vscode.FileSystemError.Unavailable("Save aborted: synced from Android.");
+                        } else if (choice === "Force your changes to Android") {
+                            // Proceed to save
+                        } else {
+                            throw vscode.FileSystemError.Unavailable("Save cancelled due to conflict.");
+                        }
+                    } else {
+                        // Safe re-pull
+                        await this.cacheManager.pullFileToCache(deviceId, workspaceRoot, relativePath);
+                        this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Changed, uri }]);
+                        throw vscode.FileSystemError.Unavailable("Save aborted: remote was newer, file reloaded.");
+                    }
+                }
+            }
+        }
         
         try {
             if (content.byteLength > 0 || !options.create) {
@@ -275,6 +372,24 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                 
                 if (!catOutput.endsWith("OK")) {
                     throw vscode.FileSystemError.Unavailable(`Failed to save file remotely: ${catOutput.replace('ERR', '').trim()}`);
+                }
+                
+                // Update baseline after successful write
+                if (workspaceFolder) {
+                    const currentUser = await shell.getCurrentUser();
+                    const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+                    const statCmd = `${prefix} stat -c "%Y %s" "${targetPath}"`;
+                    const statOutput = (await shell.executeCommand(statCmd)).trim().split(/\r?\n/).pop() || "";
+                    const statParts = statOutput.split(' ');
+                    if (statParts.length === 2) {
+                        const newMtime = parseInt(statParts[0], 10) * 1000;
+                        const newSize = parseInt(statParts[1], 10);
+                        this.cacheManager.updateBaseline(deviceId, workspaceRoot, relativePath, {
+                            md5: localHash,
+                            mtime: newMtime,
+                            size: newSize
+                        });
+                    }
                 }
                 
                 this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Changed, uri }]);
@@ -351,6 +466,14 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                     console.error(`Failed to delete local cache at ${cachedFilePath}: ${e}`);
                 }
             }
+            // Remove baseline for file or all child files if directory
+            if (options.recursive) {
+                // If we need to remove a whole directory's baselines, we'd need a clear method,
+                // but for v1 simply removing the specific path handles files.
+                // A full directory deletion might leave orphaned manifest entries,
+                // which get cleaned up during syncLocalCache anyway.
+            }
+            this.cacheManager.removeBaseline(deviceId, workspaceRoot, relativePath);
         }
         
         this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
@@ -397,6 +520,12 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                 try {
                     await fs.promises.mkdir(path.dirname(newCachedFilePath), { recursive: true });
                     await fs.promises.rename(oldCachedFilePath, newCachedFilePath);
+                    
+                    const oldBaseline = this.cacheManager.getBaseline(deviceId, workspaceRoot, oldRelative);
+                    if (oldBaseline) {
+                        this.cacheManager.updateBaseline(deviceId, workspaceRoot, newRelative, oldBaseline);
+                        this.cacheManager.removeBaseline(deviceId, workspaceRoot, oldRelative);
+                    }
                 } catch (e) {
                     console.error(`Failed to move local cache from ${oldCachedFilePath} to ${newCachedFilePath}: ${e}`);
                 }
