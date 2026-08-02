@@ -49,9 +49,23 @@ export class ToyboxManager {
         this.cachedPrefixes.set(key, prefix);
     }
 
-    public getRawFolderPath(deviceId: string, username: string): string {
+    public async getRawFolderPath(deviceId: string, username: string, shell?: import('./connectionManager').PersistentAdbShell): Promise<string> {
         const key = `${deviceId}_${username}`;
-        return this.rawFolderPaths.get(key) || RAW_DIR;
+        const folderPath = this.rawFolderPaths.get(key) || RAW_DIR;
+        
+        if (folderPath === RAW_DIR) {
+            try {
+                await this.execAdb(deviceId, `shell mkdir -p ${RAW_DIR}`);
+                await this.execAdb(deviceId, `shell chmod 711 ${RAW_DIR}`);
+            } catch (e) {}
+        } else if (shell) {
+            try {
+                await shell.executeCommand(`mkdir -p ${folderPath}`);
+                await shell.executeCommand(`chmod 700 ${folderPath}`);
+            } catch (e) {}
+        }
+        
+        return folderPath;
     }
 
     public setRawFolderPath(deviceId: string, username: string, path: string): void {
@@ -61,12 +75,8 @@ export class ToyboxManager {
 
     private async _resolveToyboxPrefix(deviceId: string, username: string): Promise<string> {
         if (username === 'shell' || username === 'root') {
-            try {
-                await this.execAdb(deviceId, `shell mkdir -p ${RAW_DIR}`);
-                this.setRawFolderPath(deviceId, username, RAW_DIR);
-            } catch (e) {
-                // ignore
-            }
+            this.setRawFolderPath(deviceId, username, RAW_DIR);
+            await this.getRawFolderPath(deviceId, username);
         }
 
         // 1. Check if natively available
@@ -108,10 +118,9 @@ export class ToyboxManager {
             }
 
             progress.report({ message: `Pushing toybox to device...` });
-            await this.execAdb(deviceId, `shell mkdir -p ${RAW_DIR}`);
-            await this.execAdb(deviceId, `shell chmod 775 ${RAW_DIR}`);
+            await this.getRawFolderPath(deviceId, username);
             await this.execAdb(deviceId, `push "${localToyboxPath}" ${TOYBOX_PATH}`);
-            await this.execAdb(deviceId, `shell chmod 774 ${TOYBOX_PATH}`);
+            await this.execAdb(deviceId, `shell chmod 755 ${TOYBOX_PATH}`);
 
             this.setToyboxPrefix(deviceId, username, TOYBOX_PATH);
             return TOYBOX_PATH;

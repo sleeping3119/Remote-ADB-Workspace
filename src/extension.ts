@@ -105,7 +105,6 @@ export async function activate(context: vscode.ExtensionContext) {
                 Logger.logError(`[Extension Activate] Cache initialization failed: ${e}`);
             });
         }
-        
         } finally {
             resolveInit();
         }
@@ -247,15 +246,15 @@ export async function activate(context: vscode.ExtensionContext) {
                     absTargetFolder = `${pwd}/${absTargetFolder}`;
                 }
 
-                // Always ensure the target folder exists and has correct permissions
+                // Always ensure the target folder parent exists
                 if (absTargetFolder.includes('/')) {
                     const parent = absTargetFolder.substring(0, absTargetFolder.lastIndexOf('/'));
                     await shell.executeCommand(`mkdir -p ${parent}`);
                 }
-                await shell.executeCommand(`mkdir -p ${absTargetFolder}`);
-                await shell.executeCommand(`chmod 775 ${absTargetFolder}`);
-
+                
+                // Register path and let getRawFolderPath handle directory creation and permissions
                 toyboxManager.setRawFolderPath(deviceId, user.name, absTargetFolder);
+                await toyboxManager.getRawFolderPath(deviceId, user.name, shell);
 
                 const checkRaw = await shell.executeCommand('ls -A /data/local/tmp/.raw 2>/dev/null');
                 if (checkRaw.trim()) {

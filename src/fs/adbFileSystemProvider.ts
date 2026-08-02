@@ -190,35 +190,30 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         
         // 2. Resolve workspace folder to use cache
         const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
-        
-        if (workspaceFolder) {
-            const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceFolder.uri.path);
-            const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
-            const cachedFilePath = path.join(cacheDir, relativePath);
-            
-            // Check if it exists in cache
-            if (!fs.existsSync(cachedFilePath)) {
-                // Not in cache, pull using tar
-                await this.cacheManager.pullFileToCache(deviceId, workspaceFolder.uri.path, relativePath);
-            }
-            
-            if (fs.existsSync(cachedFilePath)) {
-                return await fs.promises.readFile(cachedFilePath);
-            }
+        const workspaceRoot = workspaceFolder ? workspaceFolder.uri.path : "/";
+        const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceRoot);
+        const relativePath = workspaceFolder 
+            ? targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '')
+            : targetPath.replace(/^\/+/, '');
+        const cachedFilePath = path.join(cacheDir, relativePath);
+
+        // Check if it exists in cache
+        if (!fs.existsSync(cachedFilePath) && workspaceFolder) {
+            // Not in cache, pull using tar
+            await this.cacheManager.pullFileToCache(deviceId, workspaceFolder.uri.path, relativePath);
         }
         
-        // 3. Fallback to ADB pull if not in workspace or tar failed to produce the file
-        const tmpFile = path.join(os.tmpdir(), `adb-fs-pull-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
+        if (fs.existsSync(cachedFilePath)) {
+            return await fs.promises.readFile(cachedFilePath);
+        }
+        
+        // 3. Fallback to ADB pull directly into local cache file
         try {
-            await this.connectionManager.executeCommandForDevice(deviceId, `pull "${targetPath}" "${tmpFile}"`);
-            const data = await fs.promises.readFile(tmpFile);
-            return data;
+            await fs.promises.mkdir(path.dirname(cachedFilePath), { recursive: true });
+            await this.connectionManager.executeCommandForDevice(deviceId, `pull "${targetPath}" "${cachedFilePath}"`);
+            return await fs.promises.readFile(cachedFilePath);
         } catch (e: any) {
             throw vscode.FileSystemError.FileNotFound(uri);
-        } finally {
-            if (fs.existsSync(tmpFile)) {
-                fs.unlinkSync(tmpFile);
-            }
         }
     }
 
@@ -226,18 +221,69 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         await this.connectionManager.waitForShellReady();
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;
+        const shell = await this.connectionManager.getPersistentShell(deviceId);
         
-        const tmpFile = path.join(os.tmpdir(), `adb-fs-push-${Date.now()}-${Math.floor(Math.random() * 1000)}`);
-        try {
-            await fs.promises.writeFile(tmpFile, content);
-            await this.connectionManager.executeCommandForDevice(deviceId, `push "${tmpFile}" "${targetPath}"`);
-            this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Changed, uri }]);
-        } catch (e: any) {
-            throw vscode.FileSystemError.Unavailable(uri);
-        } finally {
-            if (fs.existsSync(tmpFile)) {
-                fs.unlinkSync(tmpFile);
+        // Atomic creation step
+        if (options.create) {
+            const parentPath = path.posix.dirname(targetPath);
+            const cmd = `if [ ! -w "${parentPath}" ]; then echo "NO_WRITE"; else touch "${targetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
+            const output = (await shell.executeCommand(cmd)).trim();
+            
+            if (output.startsWith("NO_WRITE")) {
+                throw vscode.FileSystemError.NoPermissions(`'${path.posix.basename(parentPath)}' folder has no write permission. You can only modify existing files in it.`);
             }
+            
+            if (!output.endsWith("OK")) {
+                throw vscode.FileSystemError.Unavailable(`Failed to create file: ${output.replace('ERR', '').trim()}`);
+            }
+            
+            // Sync structure using tar immediately before any reads can happen
+            const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
+            if (workspaceFolder) {
+                const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
+                await this.cacheManager.pullFileToCache(deviceId, workspaceFolder.uri.path, relativePath);
+            }
+            
+            this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Created, uri }]);
+        }
+        
+        // Resolve cache file path
+        const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
+        const workspaceRoot = workspaceFolder ? workspaceFolder.uri.path : "/";
+        const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceRoot);
+        const relativePath = workspaceFolder 
+            ? targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '')
+            : targetPath.replace(/^\/+/, '');
+        const cachedFilePath = path.join(cacheDir, relativePath);
+        
+        try {
+            if (content.byteLength > 0 || !options.create) {
+                // Write directly to our local cache file
+                await fs.promises.mkdir(path.dirname(cachedFilePath), { recursive: true });
+                await fs.promises.writeFile(cachedFilePath, content);
+
+                // Push to .raw folder first, then cat into targetPath to follow symlinks safely
+                const currentUser = await shell.getCurrentUser();
+                const rawFolder = await this.toyboxManager.getRawFolderPath(deviceId, currentUser.name);
+                const tempRawFileName = 'push_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+                const tempRawPath = path.posix.join(rawFolder, tempRawFileName);
+                
+                await this.connectionManager.executeCommandForDevice(deviceId, `push "${cachedFilePath}" "${tempRawPath}"`);
+                
+                const catCmd = `cat "${tempRawPath}" > "${targetPath}" 2>&1 && rm -f "${tempRawPath}" && echo "OK" || echo "ERR:$?"`;
+                const catOutput = (await shell.executeCommand(catCmd)).trim();
+                
+                if (!catOutput.endsWith("OK")) {
+                    throw vscode.FileSystemError.Unavailable(`Failed to save file remotely: ${catOutput.replace('ERR', '').trim()}`);
+                }
+                
+                this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Changed, uri }]);
+            }
+        } catch (e: any) {
+            if (e instanceof vscode.FileSystemError) {
+                throw e;
+            }
+            throw vscode.FileSystemError.Unavailable(uri);
         }
     }
 
@@ -246,10 +292,26 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;
         const shell = await this.connectionManager.getPersistentShell(deviceId);
-        const currentUser = await shell.getCurrentUser();
-        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
-        await shell.executeCommand(`${prefix} mkdir -p "${targetPath}"`);
+        const parentPath = path.posix.dirname(targetPath);
+        const cmd = `if [ ! -w "${parentPath}" ]; then echo "NO_WRITE"; else mkdir -p "${targetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
+        const output = (await shell.executeCommand(cmd)).trim();
+        
+        if (output.startsWith("NO_WRITE")) {
+            throw vscode.FileSystemError.NoPermissions(`'${path.posix.basename(parentPath)}' folder has no write permission. You can only modify existing files in it.`);
+        }
+        
+        if (!output.endsWith("OK")) {
+            throw vscode.FileSystemError.Unavailable(`Failed to create folder: ${output.replace('ERR', '').trim()}`);
+        }
+        
+        // Atomic local cache structure update
+        const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
+        if (workspaceFolder) {
+            const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
+            await this.cacheManager.pullFileToCache(deviceId, workspaceFolder.uri.path, relativePath);
+        }
+        
         this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Created, uri }]);
     }
 
@@ -261,8 +323,36 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const currentUser = await shell.getCurrentUser();
         const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
+        const parentPath = path.posix.dirname(targetPath);
         const rmArgs = options.recursive ? '-rf' : '-f';
-        await shell.executeCommand(`${prefix} rm ${rmArgs} "${targetPath}"`);
+        const cmd = `if [ ! -w "${parentPath}" ]; then echo "NO_WRITE"; else ${prefix} rm ${rmArgs} "${targetPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
+        const output = (await shell.executeCommand(cmd)).trim();
+        
+        if (output.startsWith("NO_WRITE")) {
+            throw vscode.FileSystemError.NoPermissions(`'${path.posix.basename(parentPath)}' folder has no write permission.`);
+        }
+        
+        if (!output.endsWith("OK")) {
+            throw vscode.FileSystemError.Unavailable(`Failed to delete: ${output.replace('ERR', '').trim()}`);
+        }
+        
+        // Remove from local cache
+        const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
+        if (workspaceFolder) {
+            const workspaceRoot = workspaceFolder.uri.path;
+            const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceRoot);
+            const relativePath = targetPath.substring(workspaceRoot.length).replace(/^\/+/, '');
+            const cachedFilePath = path.join(cacheDir, relativePath);
+            
+            if (fs.existsSync(cachedFilePath)) {
+                try {
+                    await fs.promises.rm(cachedFilePath, { recursive: true, force: true });
+                } catch (e) {
+                    console.error(`Failed to delete local cache at ${cachedFilePath}: ${e}`);
+                }
+            }
+        }
+        
         this._onDidChangeFile.fire([{ type: vscode.FileChangeType.Deleted, uri }]);
     }
 
@@ -276,7 +366,43 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const currentUser = await shell.getCurrentUser();
         const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
-        await shell.executeCommand(`${prefix} mv "${oldPath}" "${newPath}"`);
+        const oldParentPath = path.posix.dirname(oldPath);
+        const newParentPath = path.posix.dirname(newPath);
+        
+        // Check permissions on both the source parent and destination parent
+        const cmd = `if [ ! -w "${oldParentPath}" ] || [ ! -w "${newParentPath}" ]; then echo "NO_WRITE"; else ${prefix} mv "${oldPath}" "${newPath}" 2>&1 && echo "OK" || echo "ERR:$?"; fi`;
+        const output = (await shell.executeCommand(cmd)).trim();
+        
+        if (output.startsWith("NO_WRITE")) {
+            throw vscode.FileSystemError.NoPermissions(`Missing write permission in source or destination directory.`);
+        }
+        
+        if (!output.endsWith("OK")) {
+            throw vscode.FileSystemError.Unavailable(`Failed to rename: ${output.replace('ERR', '').trim()}`);
+        }
+
+        // Move in local cache
+        const workspaceFolderOld = vscode.workspace.workspaceFolders?.find(f => oldPath.startsWith(f.uri.path));
+        const workspaceFolderNew = vscode.workspace.workspaceFolders?.find(f => newPath.startsWith(f.uri.path));
+        
+        if (workspaceFolderOld && workspaceFolderNew && workspaceFolderOld.uri.path === workspaceFolderNew.uri.path) {
+            const workspaceRoot = workspaceFolderOld.uri.path;
+            const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceRoot);
+            const oldRelative = oldPath.substring(workspaceRoot.length).replace(/^\/+/, '');
+            const newRelative = newPath.substring(workspaceRoot.length).replace(/^\/+/, '');
+            const oldCachedFilePath = path.join(cacheDir, oldRelative);
+            const newCachedFilePath = path.join(cacheDir, newRelative);
+            
+            if (fs.existsSync(oldCachedFilePath)) {
+                try {
+                    await fs.promises.mkdir(path.dirname(newCachedFilePath), { recursive: true });
+                    await fs.promises.rename(oldCachedFilePath, newCachedFilePath);
+                } catch (e) {
+                    console.error(`Failed to move local cache from ${oldCachedFilePath} to ${newCachedFilePath}: ${e}`);
+                }
+            }
+        }
+        
         this._onDidChangeFile.fire([
             { type: vscode.FileChangeType.Deleted, uri: oldUri },
             { type: vscode.FileChangeType.Created, uri: newUri }

@@ -16,8 +16,10 @@ export class CacheManager {
     }
 
     public getCacheDir(deviceId: string, workspaceRoot: string): string {
+        // Strip trailing slash to ensure consistency between manifest paths and VS Code URI paths
+        const normalizedRoot = workspaceRoot.replace(/\/+$/, '');
         const sanitizedDeviceId = deviceId.replace(/[/\\:*?"<>|]/g, '_');
-        const sanitizedRoot = workspaceRoot.replace(/[/\\:*?"<>|]/g, '_');
+        const sanitizedRoot = normalizedRoot.replace(/[/\\:*?"<>|]/g, '_');
         return path.join(this.cacheRoot, sanitizedDeviceId, sanitizedRoot);
     }
 
@@ -43,7 +45,7 @@ export class CacheManager {
         const adbPath = await this.connectionManager.toolsManager.getAdbPath();
         const shell = await this.connectionManager.getPersistentShell(deviceId);
         const currentUser = await shell.getCurrentUser();
-        const rawFolder = this.toyboxManager.getRawFolderPath(deviceId, currentUser.name);
+        const rawFolder = await this.toyboxManager.getRawFolderPath(deviceId, currentUser.name, shell);
         
         const runId = `tar_${Date.now()}`;
         const statusFile = `${rawFolder}/.${runId}_status`;
@@ -60,7 +62,6 @@ export class CacheManager {
         }
         
         const shellCmd = `
-mkdir -p "${rawFolder}" 2>/dev/null
 cd "${workspaceRoot}" || { printf 'FATAL_CD\\n' > "${statusFile}"; exit 100; }
 rm -f "${statusFile}" "${errorFile}"
 toybox tar chf - . 2>"${errorFile}"
@@ -264,6 +265,7 @@ exit "$tar_status"
                     fs.mkdirSync(cacheDir, { recursive: true });
                 }
                 
+                Logger.logCommand(`"${adbPath}" -s ${deviceId} exec-out '${shellCmd}'`);
                 const adbProc = spawn(adbPath, ['-s', deviceId, 'exec-out', shellCmd], {
                     stdio: ['ignore', 'pipe', 'pipe']
                 });
