@@ -245,8 +245,15 @@ export class ConnectionManager {
 
     public async getPersistentShell(deviceId: string): Promise<PersistentAdbShell> {
         const realId = await this.resolveDeviceId(deviceId);
+        
+        let previousSwitchCommand: SwitchCommandState | undefined;
         if (this.shells.has(realId)) {
-            return this.shells.get(realId)!;
+            const existingShell = this.shells.get(realId)!;
+            if (!existingShell.isDead) {
+                return existingShell;
+            }
+            previousSwitchCommand = existingShell.activeSwitchCommand;
+            this.shells.delete(realId);
         }
 
         if (this.pendingShells.has(realId)) {
@@ -256,6 +263,19 @@ export class ConnectionManager {
         const shellPromise = (async () => {
             const adbPath = await this.toolsManager.getAdbPath();
             const shell = new PersistentAdbShell(adbPath, realId);
+            
+            if (previousSwitchCommand) {
+                if (previousSwitchCommand.type === 'root') {
+                    await shell.sendRawCommand('su');
+                } else if (previousSwitchCommand.type === 'termux') {
+                    await shell.sendRawCommand('run-as com.termux');
+                } else if (previousSwitchCommand.type === 'custom' && previousSwitchCommand.pkgName) {
+                    await shell.sendRawCommand(`run-as ${previousSwitchCommand.pkgName}`);
+                }
+                shell.activeSwitchCommand = previousSwitchCommand;
+                shell.refreshCurrentUser();
+            }
+            
             this.shells.set(realId, shell);
             this.pendingShells.delete(realId);
             return shell;
