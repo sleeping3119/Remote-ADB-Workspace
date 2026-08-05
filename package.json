@@ -161,6 +161,14 @@
           "description": "Path to the custom ADB executable (leave blank to use automatically downloaded platform-tools)"
         }
       }
+    },
+    "terminal": {
+      "profiles": [
+        {
+          "title": "ADB Shell",
+          "id": "remote-adb.terminalProfile"
+        }
+      ]
     }
   },
   "scripts": {
