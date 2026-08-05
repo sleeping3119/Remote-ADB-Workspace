@@ -49,14 +49,15 @@ export class ToyboxManager {
         this.cachedPrefixes.set(key, prefix);
     }
 
-    public async getRawFolderPath(deviceId: string, username: string, shell?: import('./connectionManager').PersistentAdbShell): Promise<string> {
+    public async getRawFolderPath(deviceId: string, username: string = 'shell', shell?: import('./connectionManager').PersistentAdbShell): Promise<string> {
         const key = `${deviceId}_${username}`;
         const folderPath = this.rawFolderPaths.get(key) || RAW_DIR;
         
         if (folderPath === RAW_DIR) {
             try {
                 await this.execAdb(deviceId, `shell mkdir -p ${RAW_DIR}`);
-                await this.execAdb(deviceId, `shell chmod 711 ${RAW_DIR}`);
+                // Use 777 to allow apps like termux to read/write files pushed here by adb host
+                await this.execAdb(deviceId, `shell chmod 777 ${RAW_DIR}`);
             } catch (e) {}
         } else if (shell) {
             try {

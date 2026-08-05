@@ -8,6 +8,7 @@ import { Logger } from '../logger';
 import { ConnectionManager } from '../adb/connectionManager';
 import { ToyboxManager } from '../adb/toyboxManager';
 import { escapePath } from '../utils/shellUtils';
+import { isInvalidWindowsPath } from '../utils/pathUtils';
 
 export interface FileBaseline {
     md5: string;
@@ -139,8 +140,18 @@ printf 'COMPLETE\\nEXIT=%s\\n' "$tar_status" > "${safeStatusFile}"
 exit "$tar_status"
 `.trim();
         
-        const fullAdbCommand = `"${adbPath}" -s ${deviceId} exec-out '${shellCmd}'`;
-        Logger.logCommand(`[CacheManager] Executing background cache shell command: ${shellCmd}`);
+        let execOutCmd = shellCmd;
+        if (shell.activeSwitchCommand) {
+            const escapedCmd = shellCmd.replace(/'/g, "'\\''");
+            if (shell.activeSwitchCommand.type === 'termux' || shell.activeSwitchCommand.type === 'custom') {
+                execOutCmd = `run-as ${shell.activeSwitchCommand.pkgName} sh -c '${escapedCmd}'`;
+            } else if (shell.activeSwitchCommand.type === 'root') {
+                execOutCmd = `su -c '${escapedCmd}'`;
+            }
+        }
+
+        const fullAdbCommand = `"${adbPath}" -s ${deviceId} exec-out '${execOutCmd}'`;
+        Logger.logCommand(`[CacheManager] Executing background cache shell command: ${execOutCmd}`);
         Logger.logCommand(`[CacheManager] Full subprocess command: ${fullAdbCommand}`);
         
         return vscode.window.withProgress({
@@ -149,7 +160,7 @@ exit "$tar_status"
             cancellable: true
         }, (progress, token) => {
             return new Promise<void>((resolve, reject) => {
-                const adbProc = spawn(adbPath, ['-s', deviceId, 'exec-out', shellCmd], {
+                const adbProc = spawn(adbPath, ['-s', deviceId, 'exec-out', execOutCmd], {
                     stdio: ['ignore', 'pipe', 'pipe']
                 });
                 
@@ -159,12 +170,15 @@ exit "$tar_status"
                 let inFlightPath: string | null = null;
                 
                 const cleanupInFlight = () => {
-                    if (inFlightPath) {
+                    if (inFlightPath && inFlightPath !== '.' && inFlightPath !== './') {
                         const suspectFile = path.join(cacheDir, inFlightPath);
                         Logger.logOutput(`[CacheManager] Cleaning up in-flight truncated file: ${suspectFile}`);
                         try {
                             if (fs.existsSync(suspectFile)) {
-                                fs.unlinkSync(suspectFile);
+                                const stat = fs.statSync(suspectFile);
+                                if (stat.isFile()) {
+                                    fs.unlinkSync(suspectFile);
+                                }
                             }
                         } catch (e) {
                             Logger.logError(`[CacheManager] Failed to remove in-flight file ${suspectFile}: ${e}`);
@@ -187,10 +201,24 @@ exit "$tar_status"
                     });
                 };
                 
+                const windowsSkippedFiles: { file: string, reason: string }[] = [];
                 const extractStream = tar.extract({ 
                     cwd: cacheDir,
                     onentry: (entry) => {
-                        inFlightPath = entry.path;
+                        if (entry.type === 'File') {
+                            inFlightPath = entry.path;
+                            if (process.platform === 'win32') {
+                                const check = isInvalidWindowsPath(entry.path);
+                                if (check.invalid) {
+                                    const reason = `Windows Invalid Path: ${check.reason}`;
+                                    windowsSkippedFiles.push({ file: entry.path, reason });
+                                    Logger.logWarning(`[CacheManager] Skipping invalid Windows path "${entry.path}": ${check.reason}`);
+                                    vscode.window.showWarningMessage(`Skipping file invalid on Windows (${check.reason}): ${entry.path}`);
+                                }
+                            }
+                        } else {
+                            inFlightPath = null;
+                        }
                         entry.on('end', () => {
                             if (inFlightPath === entry.path) {
                                 inFlightPath = null;
@@ -240,6 +268,13 @@ exit "$tar_status"
                     Logger.logOutput(`[CacheManager] Cache extraction stream finished.`);
                     inFlightPath = null;
                     streamFinished = true;
+                });
+                
+                extractStream.on('warn', (code, message, data) => {
+                    const fileInfo = data?.path || data?.file || 'unknown';
+                    windowsSkippedFiles.push({ file: fileInfo, reason: `tar warning: ${message}` });
+                    Logger.logWarning(`[CacheManager] Tar initialization warning on ${fileInfo} (Code: ${code}): ${message}`);
+                    vscode.window.showWarningMessage(`Skipped cache file due to illegal Windows characters or extraction error: ${fileInfo}`);
                 });
                 
                 extractStream.on('error', (err) => {
@@ -300,16 +335,26 @@ exit "$tar_status"
                             }
                         }
                         
+                        // Combine remote and local skipped files
+                        skippedEntries.push(...windowsSkippedFiles);
+                        
                         // Save skipped entries to workspaceState for transparency
                         const skippedKey = `cache_skipped_${deviceId}_${workspaceRoot}`;
                         this.context.workspaceState.update(skippedKey, skippedEntries);
                         
-                        if (remoteTarExitCode === 0) {
-                            Logger.logOutput(`[CacheManager] Remote tar completed successfully.`);
+                        if (remoteTarExitCode === 0 && skippedEntries.length === 0) {
+                            Logger.logOutput(`[CacheManager] Summary: Cache initialization completed successfully. All files were transferred with 0 files skipped.`);
+                            this.context.workspaceState.update(stateKey, true);
+                            resolve();
+                        } else if (remoteTarExitCode === 0 && skippedEntries.length > 0) {
+                            Logger.logOutput(`[CacheManager] Summary: Cache initialization completed successfully, but ${skippedEntries.length} files were skipped during extraction:`);
+                            skippedEntries.forEach(entry => {
+                                Logger.logOutput(`  - Skipped: ${entry.file} (Reason: ${entry.reason})`);
+                            });
                             this.context.workspaceState.update(stateKey, true);
                             resolve();
                         } else if (skippedEntries.length > 0) {
-                            Logger.logOutput(`[CacheManager] Remote tar completed with ${skippedEntries.length} skipped entries:`);
+                            Logger.logOutput(`[CacheManager] Summary: Remote tar completed with ${skippedEntries.length} skipped entries:`);
                             skippedEntries.forEach(entry => {
                                 Logger.logOutput(`  - Skipped: ${entry.file} (Reason: ${entry.reason})`);
                             });
@@ -317,7 +362,6 @@ exit "$tar_status"
                             if (otherErrors.length > 0) {
                                 Logger.logError(`[CacheManager] Unattributed tar errors:\n${otherErrors.join('\n')}`);
                             }
-                            // Still mark as successful because we got the bulk of the files
                             this.context.workspaceState.update(stateKey, true);
                             resolve();
                         } else {
@@ -373,6 +417,17 @@ exit "$tar_status"
         
         const shellCmd = `cd "${safeWorkspaceRoot}" && toybox tar chf - "${safeRelPath}" 2>/dev/null`;
         
+        const shell = await this.connectionManager.getPersistentShell(deviceId);
+        let execOutCmd = shellCmd;
+        if (shell.activeSwitchCommand) {
+            const escapedCmd = shellCmd.replace(/'/g, "'\\''");
+            if (shell.activeSwitchCommand.type === 'termux') {
+                execOutCmd = `run-as ${shell.activeSwitchCommand.pkgName} sh -c '${escapedCmd}'`;
+            } else if (shell.activeSwitchCommand.type === 'root') {
+                execOutCmd = `su -c '${escapedCmd}'`;
+            }
+        }
+
         return vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: `Downloading ${path.basename(relativePath)}...`,
@@ -383,12 +438,23 @@ exit "$tar_status"
                     fs.mkdirSync(cacheDir, { recursive: true });
                 }
                 
-                Logger.logCommand(`"${adbPath}" -s ${deviceId} exec-out '${shellCmd}'`);
-                const adbProc = spawn(adbPath, ['-s', deviceId, 'exec-out', shellCmd], {
+                Logger.logCommand(`"${adbPath}" -s ${deviceId} exec-out '${execOutCmd}'`);
+                const adbProc = spawn(adbPath, ['-s', deviceId, 'exec-out', execOutCmd], {
                     stdio: ['ignore', 'pipe', 'pipe']
                 });
                 
-                const extractStream = tar.extract({ cwd: cacheDir });
+                const extractStream = tar.extract({ 
+                    cwd: cacheDir,
+                    onentry: (entry) => {
+                        if (entry.type === 'File' && process.platform === 'win32') {
+                            const check = isInvalidWindowsPath(entry.path);
+                            if (check.invalid) {
+                                Logger.logWarning(`[CacheManager] File is invalid on Windows "${entry.path}": ${check.reason}`);
+                                vscode.window.showWarningMessage(`File is invalid on Windows (${check.reason}): ${entry.path}`);
+                            }
+                        }
+                    }
+                });
                 
                 const cleanupFile = () => {
                     const filePath = path.join(cacheDir, relativePath);
@@ -423,6 +489,12 @@ exit "$tar_status"
                     }
                     resolve();
                 });
+                extractStream.on('warn', (code, message, data) => {
+                    const fileInfo = data?.path || data?.file || 'unknown';
+                    Logger.logWarning(`[CacheManager] Tar extraction warning on ${fileInfo} (Code: ${code}): ${message}`);
+                    vscode.window.showWarningMessage(`Could not save file to Windows cache: ${fileInfo}. (Likely contains illegal characters like ':')`);
+                });
+                
                 extractStream.on('error', (err) => {
                     cleanupFile();
                     reject(err);

@@ -19,6 +19,10 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
     private toyboxManager: ToyboxManager;
     private cacheManager: CacheManager;
     
+    // Negative cache to store paths that do not exist on the device, with a TTL timestamp
+    private negativeStatCache = new Map<string, number>();
+    private readonly NEGATIVE_CACHE_TTL_MS = 10000; // 10 seconds
+    
     private _onDidChangeFile = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
     readonly onDidChangeFile = this._onDidChangeFile.event;
     
@@ -33,6 +37,16 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     async stat(uri: vscode.Uri): Promise<vscode.FileStat> {
+        const uriStr = uri.toString();
+        const now = Date.now();
+        if (this.negativeStatCache.has(uriStr)) {
+            if (now - this.negativeStatCache.get(uriStr)! < this.NEGATIVE_CACHE_TTL_MS) {
+                throw vscode.FileSystemError.FileNotFound(uri);
+            } else {
+                this.negativeStatCache.delete(uriStr);
+            }
+        }
+
         await this.connectionManager.waitForShellReady();
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;
@@ -49,13 +63,17 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const lines = output.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
         
         if (lines.length < 3 || lines[2].includes('No such file') || lines[2].includes('stat: ')) {
+            this.negativeStatCache.set(uriStr, Date.now());
             throw vscode.FileSystemError.FileNotFound(uri);
         }
         
         const writeStatus = lines[0];
         const dirStatus = lines[1];
         const parts = lines[2].split(' ');
-        if (parts.length < 3) throw vscode.FileSystemError.FileNotFound(uri);
+        if (parts.length < 3) {
+            this.negativeStatCache.set(uriStr, Date.now());
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
         
         const modeHex = parts[0];
         const size = parseInt(parts[1], 10);
@@ -170,6 +188,16 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const currentUser = await shell.getCurrentUser();
         const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
 
+        const uriStr = uri.toString();
+        const now = Date.now();
+        if (this.negativeStatCache.has(uriStr)) {
+            if (now - this.negativeStatCache.get(uriStr)! < this.NEGATIVE_CACHE_TTL_MS) {
+                throw vscode.FileSystemError.FileNotFound(uri);
+            } else {
+                this.negativeStatCache.delete(uriStr);
+            }
+        }
+
         const safePath = escapePath(targetPath);
         // 1. Check existence and read permissions, and fetch remote mtime/size
         const checkCmd = `if [ -e "${safePath}" ]; then if [ -r "${safePath}" ]; then ${prefix} stat -c "OK|%Y|%s" "${safePath}"; else echo "NO_READ"; fi; else echo "NOT_FOUND"; fi`;
@@ -191,7 +219,12 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                 this.cacheManager.removeBaseline(deviceId, workspaceFolder.uri.path, relativePath);
             }
             
-            throw lastLine === "NOT_FOUND" ? vscode.FileSystemError.FileNotFound(uri) : vscode.FileSystemError.NoPermissions(uri);
+            if (lastLine === "NOT_FOUND") {
+                this.negativeStatCache.set(uriStr, Date.now());
+                throw vscode.FileSystemError.FileNotFound(uri);
+            } else {
+                throw vscode.FileSystemError.NoPermissions(uri);
+            }
         }
         
         // 2. Resolve workspace folder to use cache
@@ -258,17 +291,12 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             return await fs.promises.readFile(cachedFilePath);
         }
         
-        // 3. Fallback to ADB pull directly into local cache file
-        try {
-            await fs.promises.mkdir(path.dirname(cachedFilePath), { recursive: true });
-            await this.connectionManager.executeCommandForDevice(deviceId, `pull "${escapePath(targetPath)}" "${escapePath(cachedFilePath)}"`);
-            return await fs.promises.readFile(cachedFilePath);
-        } catch (e: any) {
-            throw vscode.FileSystemError.FileNotFound(uri);
-        }
+        // 3. If file still doesn't exist, it failed to extract (e.g. illegal windows characters like ':')
+        throw vscode.FileSystemError.Unavailable(`Cannot read file from device. (It might contain illegal characters for Windows, e.g., ':', or cannot be accessed.)`);
     }
 
     async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean, overwrite: boolean }): Promise<void> {
+        this.negativeStatCache.delete(uri.toString());
         await this.connectionManager.waitForShellReady();
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;
@@ -361,8 +389,9 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                 await fs.promises.writeFile(cachedFilePath, content);
 
                 // Push to .raw folder first, then cat into targetPath to follow symlinks safely
-                const currentUser = await shell.getCurrentUser();
-                const rawFolder = await this.toyboxManager.getRawFolderPath(deviceId, currentUser.name);
+                // We use 'shell' as the user for getRawFolderPath so it returns the global raw folder 
+                // (/data/local/tmp/.raw). ADB host pushes as 'shell', so it needs access to this directory.
+                const rawFolder = await this.toyboxManager.getRawFolderPath(deviceId, 'shell');
                 const tempRawFileName = 'push_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
                 const tempRawPath = path.posix.join(rawFolder, tempRawFileName);
                 
@@ -371,8 +400,12 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                 
                 await this.connectionManager.executeCommandForDevice(deviceId, `push "${safeCachedFile}" "${safeTempRawPath}"`);
                 
-                const catCmd = `cat "${safeTempRawPath}" > "${safeTargetPath}" 2>&1 && rm -f "${safeTempRawPath}" && echo "OK" || echo "ERR:$?"`;
+                const catCmd = `cat "${safeTempRawPath}" > "${safeTargetPath}" 2>&1 && echo "OK" || echo "ERR:$?"`;
                 const catOutput = (await shell.executeCommand(catCmd)).trim();
+                
+                // The temp file was pushed by the adb shell user, so the run-as app user lacks permission to delete it.
+                // We delete it using the adb shell directly.
+                await this.connectionManager.executeCommandForDevice(deviceId, `shell rm -f "${safeTempRawPath}"`).catch(() => {});
                 
                 if (!catOutput.endsWith("OK")) {
                     throw vscode.FileSystemError.Unavailable(`Failed to save file remotely: ${catOutput.replace('ERR', '').trim()}`);
@@ -407,6 +440,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     async createDirectory(uri: vscode.Uri): Promise<void> {
+        this.negativeStatCache.delete(uri.toString());
         await this.connectionManager.waitForShellReady();
         const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
         const targetPath = uri.path;

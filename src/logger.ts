@@ -24,6 +24,11 @@ export class Logger {
         this.channel.show();
     }
 
+    public static logWarning(warning: string) {
+        if (!this.channel) return;
+        this.channel.appendLine(`[WARN] ${warning}`);
+    }
+
     public static show() {
         if (this.channel) this.channel.show();
     }

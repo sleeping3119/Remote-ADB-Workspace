@@ -51,16 +51,35 @@ export async function activate(context: vscode.ExtensionContext) {
         
         Logger.logOutput(`[Extension Activate] Checking for manifest at: ${manifestUri.fsPath}`);
         
-        let manifestToLog: any = undefined;
+        let fullManifest: any = undefined;
+        let slimManifest: any = undefined;
         try {
             const fs = require('fs');
             const data = await fs.promises.readFile(manifestUri.fsPath);
-            const globalManifest = JSON.parse(data.toString());
-            Logger.logOutput(`[Extension Activate] Found global manifest file. Adopting to workspace state.`);
-            manifestToLog = globalManifest;
+            fullManifest = JSON.parse(data.toString());
+            Logger.logOutput(`[Extension Activate] Found global manifest file. Processing slim manifest for workspace state.`);
             
-            // Adopt it into local workspace state and clear the file
-            context.workspaceState.update('adbValidationManifest', globalManifest);
+            // Log full manifest
+            Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(fullManifest, null, 2)}`);
+            
+            // Create slim manifest
+            slimManifest = {
+                workspaceRoot: fullManifest.workspaceRoot,
+                user: fullManifest.privilegeContext?.user || 'shell',
+                switchCommand: fullManifest.privilegeContext?.switchCommand
+            };
+            
+            // Save slim manifest to workspace state
+            context.workspaceState.update('adbValidationManifest', slimManifest);
+            
+            // Also write slim manifest to physical workspace storage
+            if (context.storageUri) {
+                await vscode.workspace.fs.createDirectory(context.storageUri);
+                const localManifestUri = vscode.Uri.joinPath(context.storageUri, 'manifest.json');
+                await vscode.workspace.fs.writeFile(localManifestUri, new TextEncoder().encode(JSON.stringify(slimManifest, null, 2)));
+                Logger.logOutput(`[Extension Activate] Saved slim manifest to workspace storage: ${localManifestUri.fsPath}`);
+            }
+            
             try {
                 await fs.promises.unlink(manifestUri.fsPath);
             } catch (e) {
@@ -68,15 +87,16 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         } catch (e) {
             // File not found, fallback to workspace state
-            manifestToLog = context.workspaceState.get('adbValidationManifest');
-            Logger.logOutput(`[Extension Activate] No global manifest file found. Checked workspaceState: ${manifestToLog ? 'Found' : 'Not Found'}`);
+            slimManifest = context.workspaceState.get('adbValidationManifest');
+            Logger.logOutput(`[Extension Activate] No global manifest file found. Checked workspaceState: ${slimManifest ? 'Found' : 'Not Found'}`);
+            if (slimManifest) {
+                Logger.logOutput(`[ADB Workspace Slim Manifest]\n${JSON.stringify(slimManifest, null, 2)}`);
+            }
         }
         
-        if (manifestToLog) {
-            Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(manifestToLog, null, 2)}`);
-            
+        if (slimManifest) {
             // Auto-restore environment if required
-            const switchCmd = manifestToLog.privilegeContext?.switchCommand;
+            const switchCmd = slimManifest.switchCommand;
             if (switchCmd && switchCmd.type !== 'shell') {
                 const shell = await connectionManager.getPersistentShell(deviceId);
                 const currentUser = await shell.getCurrentUser();
@@ -95,13 +115,13 @@ export async function activate(context: vscode.ExtensionContext) {
                 }
             }
         } else {
-            Logger.logOutput(`[Extension Activate] No manifest available to log.`);
+            Logger.logOutput(`[Extension Activate] No manifest available.`);
         }
         
         // Trigger background cache initialization if manifest exists
-        if (manifestToLog) {
+        if (slimManifest) {
             // We do not await this so it runs in the background
-            cacheManager.initializeCache(deviceId, manifestToLog.workspaceRoot).catch(e => {
+            cacheManager.initializeCache(deviceId, slimManifest.workspaceRoot).catch(e => {
                 Logger.logError(`[Extension Activate] Cache initialization failed: ${e}`);
             });
         }
@@ -193,9 +213,6 @@ export async function activate(context: vscode.ExtensionContext) {
             } catch (e: any) {
                 Logger.logError(`[Validation] Failed to save manifest to disk: ${e.message}`);
             }
-            
-            // Also persist to current workspace state
-            await context.workspaceState.update('adbValidationManifest', manifest);
             
             // Log immediately in case the window doesn't reload
             Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(manifest, null, 2)}`);
