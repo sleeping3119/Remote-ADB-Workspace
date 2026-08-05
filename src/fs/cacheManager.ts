@@ -421,7 +421,7 @@ exit "$tar_status"
         let execOutCmd = shellCmd;
         if (shell.activeSwitchCommand) {
             const escapedCmd = shellCmd.replace(/'/g, "'\\''");
-            if (shell.activeSwitchCommand.type === 'termux') {
+            if (shell.activeSwitchCommand.type === 'termux' || shell.activeSwitchCommand.type === 'custom') {
                 execOutCmd = `run-as ${shell.activeSwitchCommand.pkgName} sh -c '${escapedCmd}'`;
             } else if (shell.activeSwitchCommand.type === 'root') {
                 execOutCmd = `su -c '${escapedCmd}'`;
