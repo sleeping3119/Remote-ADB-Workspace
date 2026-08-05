@@ -1,3 +1,4 @@
+import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import { PlatformToolsManager } from './platformToolsManager';
 import { Logger } from '../logger';
@@ -17,6 +18,7 @@ export class PersistentAdbShell {
     private currentReject: ((err: Error) => void) | null = null;
     private commandQueue: { command: string, resolve: (data: string) => void, reject: (err: Error) => void, isRaw?: boolean }[] = [];
     private isBusy = false;
+    public isDead = false;
     private currentUser: { name: string, groups: string[] } | null = null;
     private pendingUserPromise: Promise<{ name: string, groups: string[] }> | null = null;
 
@@ -68,12 +70,19 @@ export class PersistentAdbShell {
         });
 
         this.process.on('close', () => {
+            this.isDead = true;
             if (this.currentReject) {
                 this.currentReject(new Error('ADB shell closed unexpectedly'));
             }
             while (this.commandQueue.length > 0) {
                 this.commandQueue.shift()?.reject(new Error('ADB shell closed'));
             }
+            this.isBusy = false;
+        });
+
+        this.process.on('error', () => {
+            this.isDead = true;
+            this.isBusy = false;
         });
 
         // Try to disable echo if possible, ignore if it fails
@@ -107,20 +116,34 @@ export class PersistentAdbShell {
         }
     }
 
-    public async executeCommand(command: string): Promise<string> {
+    public async executeCommand(command: string, timeoutMs: number = 15000): Promise<string> {
         return new Promise((resolve, reject) => {
-            this.commandQueue.push({ command, resolve, reject });
+            const timer = setTimeout(() => {
+                this.close();
+                reject(new Error(`Command timed out after ${timeoutMs}ms: ${command}`));
+            }, timeoutMs);
+
+            this.commandQueue.push({ 
+                command, 
+                resolve: (res) => { clearTimeout(timer); resolve(res); }, 
+                reject: (err) => { clearTimeout(timer); reject(err); } 
+            });
             this.processNext();
         });
     }
 
-    public async sendRawCommand(command: string): Promise<void> {
+    public async sendRawCommand(command: string, timeoutMs: number = 15000): Promise<void> {
         return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.close();
+                reject(new Error(`Raw command timed out after ${timeoutMs}ms: ${command}`));
+            }, timeoutMs);
+
             this.commandQueue.push({
                 command,
                 isRaw: true,
-                resolve: () => resolve(),
-                reject
+                resolve: () => { clearTimeout(timer); resolve(); },
+                reject: (err) => { clearTimeout(timer); reject(err); }
             });
             this.processNext();
         });
@@ -161,13 +184,30 @@ export class PersistentAdbShell {
 
 export class ConnectionManager {
     public toolsManager: PlatformToolsManager;
+    private context: vscode.ExtensionContext;
     private activeDeviceId: string | undefined;
     private shells: Map<string, PersistentAdbShell> = new Map();
     private deviceIdMap: Map<string, string> = new Map();
     private shellReadyPromise: Promise<void> | null = null;
+    private pendingGetDevices: Promise<AdbDevice[]> | null = null;
 
-    constructor(toolsManager: PlatformToolsManager) {
+    constructor(context: vscode.ExtensionContext, toolsManager: PlatformToolsManager) {
+        this.context = context;
         this.toolsManager = toolsManager;
+    }
+
+    private getKnownTcpDevices(): string[] {
+        return this.context.globalState.get<string[]>('knownTcpDevices', []);
+    }
+
+    private addKnownTcpDevice(deviceId: string) {
+        if (deviceId.includes(':')) {
+            const known = this.getKnownTcpDevices();
+            if (!known.includes(deviceId)) {
+                known.push(deviceId);
+                this.context.globalState.update('knownTcpDevices', known);
+            }
+        }
     }
 
     public setActiveDevice(deviceId: string) {
@@ -258,9 +298,6 @@ export class ConnectionManager {
             this.shells.delete(realId);
         }
     }
-
-    private pendingGetDevices: Promise<AdbDevice[]> | null = null;
-
     public async getDevices(): Promise<AdbDevice[]> {
         if (this.pendingGetDevices) {
             return this.pendingGetDevices;
@@ -271,6 +308,7 @@ export class ConnectionManager {
                 const output = await this.executeAdbCommand('devices');
                 const lines = output.split('\n');
                 const devices: AdbDevice[] = [];
+                const foundDeviceIds = new Set<string>();
                 
                 for (let i = 1; i < lines.length; i++) {
                     const line = lines[i].trim();
@@ -280,9 +318,18 @@ export class ConnectionManager {
                             const id = parts[0];
                             this.deviceIdMap.set(id.toLowerCase(), id);
                             devices.push({ id, status: parts[1] });
+                            foundDeviceIds.add(id);
                         }
                     }
                 }
+
+                // Add known TCP devices that are missing as 'offline'
+                for (const knownId of this.getKnownTcpDevices()) {
+                    if (!foundDeviceIds.has(knownId)) {
+                        devices.push({ id: knownId, status: 'offline' });
+                    }
+                }
+
                 return devices;
             } finally {
                 this.pendingGetDevices = null;
@@ -298,7 +345,11 @@ export class ConnectionManager {
     }
 
     public async connect(ipPort: string): Promise<string> {
-        return this.executeAdbCommand(`connect ${ipPort}`);
+        const result = await this.executeAdbCommand(`connect ${ipPort}`);
+        if (!result.includes('failed to connect to') && !result.includes('actively refused it') && !result.includes('cannot connect to')) {
+            this.addKnownTcpDevice(ipPort);
+        }
+        return result;
     }
 
     public async killServer(): Promise<string> {
@@ -327,7 +378,8 @@ export class ConnectionManager {
         // Only log devices command if we really want to, but it's debounced now.
         Logger.logCommand(cmd);
         return new Promise((resolve, reject) => {
-            cp.exec(cmd, (error, stdout, stderr) => {
+            const timeout = args === 'devices' ? 5000 : 0;
+            cp.exec(cmd, { timeout }, (error, stdout, stderr) => {
                 const combined = (stdout + '\n' + stderr).trim();
                 if (error) {
                     if (!combined.includes('No such file or directory') && !combined.includes('does not exist')) {

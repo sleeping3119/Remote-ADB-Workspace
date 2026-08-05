@@ -16,7 +16,7 @@ export async function activate(context: vscode.ExtensionContext) {
     console.log('Congratulations, your extension "remote-adb" is now active!');
 
     const toolsManager = new PlatformToolsManager(context);
-    const connectionManager = new ConnectionManager(toolsManager);
+    const connectionManager = new ConnectionManager(context, toolsManager);
     const toyboxManager = new ToyboxManager(toolsManager, context);
     const cacheManager = new CacheManager(context, connectionManager, toyboxManager);
 
@@ -95,24 +95,42 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         
         if (slimManifest) {
-            // Auto-restore environment if required
-            const switchCmd = slimManifest.switchCommand;
-            if (switchCmd && switchCmd.type !== 'shell') {
-                const shell = await connectionManager.getPersistentShell(deviceId);
-                const currentUser = await shell.getCurrentUser();
-                
-                if (currentUser.name === 'shell') {
-                    Logger.logOutput(`[Extension Activate] Restoring active user environment: ${switchCmd.type}`);
-                    if (switchCmd.type === 'root') {
-                        await shell.sendRawCommand('su');
-                        shell.refreshCurrentUser();
-                        shell.activeSwitchCommand = { type: 'root' };
-                    } else if (switchCmd.type === 'termux') {
-                        await setupAppEnvironment(deviceId, 'com.termux', shell, './files/home/.raw');
-                    } else if (switchCmd.type === 'custom' && switchCmd.pkgName) {
-                        await setupAppEnvironment(deviceId, switchCmd.pkgName, shell);
+            // Check if device is connected, if not and it's TCP, try to reconnect
+            const devices = await connectionManager.getDevices();
+            const isConnected = devices.find(d => d.id === deviceId && d.status === 'device');
+            if (!isConnected && deviceId.includes(':')) {
+                Logger.logOutput(`[Extension Activate] Device ${deviceId} not found, attempting auto-reconnect...`);
+                try {
+                    await connectionManager.connect(deviceId);
+                    // Wait a moment for adb to fully register the connection
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                } catch (e: any) {
+                    Logger.logError(`[Extension Activate] Auto-reconnect failed: ${e.message}`);
+                }
+            }
+
+            try {
+                // Auto-restore environment if required
+                const switchCmd = slimManifest.switchCommand;
+                if (switchCmd && switchCmd.type !== 'shell') {
+                    const shell = await connectionManager.getPersistentShell(deviceId);
+                    const currentUser = await shell.getCurrentUser();
+                    
+                    if (currentUser.name === 'shell') {
+                        Logger.logOutput(`[Extension Activate] Restoring active user environment: ${switchCmd.type}`);
+                        if (switchCmd.type === 'root') {
+                            await shell.sendRawCommand('su');
+                            shell.refreshCurrentUser();
+                            shell.activeSwitchCommand = { type: 'root' };
+                        } else if (switchCmd.type === 'termux') {
+                            await setupAppEnvironment(deviceId, 'com.termux', shell, './files/home/.raw');
+                        } else if (switchCmd.type === 'custom' && switchCmd.pkgName) {
+                            await setupAppEnvironment(deviceId, switchCmd.pkgName, shell);
+                        }
                     }
                 }
+            } catch (err: any) {
+                Logger.logError(`[Extension Activate] Failed to restore environment: ${err.message}`);
             }
         } else {
             Logger.logOutput(`[Extension Activate] No manifest available.`);
