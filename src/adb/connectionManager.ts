@@ -301,6 +301,10 @@ export class ConnectionManager {
         return this.executeAdbCommand(`connect ${ipPort}`);
     }
 
+    public async killServer(): Promise<string> {
+        return this.executeAdbCommand(`kill-server`);
+    }
+
     public async pair(ipPort: string, code: string): Promise<string> {
         return this.executeAdbCommand(`pair ${ipPort} ${code}`);
     }

@@ -229,6 +229,36 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    context.subscriptions.push(vscode.commands.registerCommand('remote-adb.handleUnauthorizedDevice', async (item: DeviceTreeItem) => {
+        if (!item || !item.device) return;
+        vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Resolving unauthorized device..." }, async () => {
+            await connectionManager.killServer();
+            if (item.device.id.includes(':')) {
+                try { await connectionManager.connect(item.device.id); } catch(e) {}
+            }
+            vscode.window.showWarningMessage(`Please check your device (${item.device.id}) and allow the USB debugging prompt.`);
+            vscode.commands.executeCommand('remote-adb.refreshDevices');
+        });
+    }));
+
+    context.subscriptions.push(vscode.commands.registerCommand('remote-adb.handleOfflineDevice', async (item: DeviceTreeItem) => {
+        if (!item || !item.device) return;
+        vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Resolving offline device..." }, async () => {
+            await connectionManager.killServer();
+            if (item.device.id.includes(':')) {
+                try { await connectionManager.connect(item.device.id); } catch(e) {}
+            }
+            const devices = await connectionManager.getDevices();
+            const reconnected = devices.find(d => d.id === item.device.id);
+            if (!reconnected || reconnected.status !== 'device') {
+                vscode.window.showErrorMessage(`Device ${item.device.id} is not responding or disconnected. Please reconnect the device or restart ADB on the phone.`);
+            } else {
+                vscode.window.showInformationMessage(`Device ${item.device.id} reconnected successfully.`);
+            }
+            vscode.commands.executeCommand('remote-adb.refreshDevices');
+        });
+    }));
+
     async function setupAppEnvironment(deviceId: string, pkgName: string, shell: import('./adb/connectionManager').PersistentAdbShell, targetFolder: string = '.raw') {
         return new Promise<boolean>(async (resolve) => {
             const cp = require('child_process');
@@ -433,21 +463,6 @@ export async function activate(context: vscode.ExtensionContext) {
     });
 
     let connectTcpipDisposable = vscode.commands.registerCommand('remote-adb.connectTcpip', async () => {
-        try {
-            const usbResult = await connectionManager.tryUsb();
-            if (usbResult && (usbResult.includes('restarting in USB mode') || usbResult.includes('already'))) {
-                const devices = await connectionManager.getDevices();
-                if (devices.length > 0) {
-                    connectionManager.setActiveDevice(devices[0].id);
-                    updateStatusBar();
-                }
-                const openAction = 'Open Folder';
-                vscode.window.showInformationMessage(`Automatically connected via USB: ${usbResult}`, openAction).then(sel => {
-                    if (sel === openAction) {vscode.commands.executeCommand('remote-adb.openFolder');}
-                });
-                return;
-            }
-        } catch (e) {}
 
         const ipPort = await vscode.window.showInputBox({ 
             prompt: 'Enter Device IP and Port (e.g. 192.168.100.238:33935)',
@@ -471,9 +486,14 @@ export async function activate(context: vscode.ExtensionContext) {
                     .then(sel => { if (sel === pairOption) {vscode.commands.executeCommand('remote-adb.pairTcpip');} });
             };
 
+            const handleAuthFailure = (target: string) => {
+                vscode.window.showWarningMessage(`ADB Connect: Failed to authenticate to ${target}. Please check the device screen and allow the USB debugging prompt.`);
+            };
+
             try {
                 const result = await connectionManager.connect(ipPort);
                 if (result.includes('failed to connect to')) {handleNotPaired(ipPort);}
+                else if (result.includes('failed to authenticate to')) {handleAuthFailure(ipPort);}
                 else if (result.includes('actively refused it') || result.includes('cannot connect to')) {
                     vscode.window.showErrorMessage(`ADB Connect failed: Connection refused.`);
                 } else {
@@ -487,6 +507,7 @@ export async function activate(context: vscode.ExtensionContext) {
             } catch (error: any) {
                 const msg = error.message || '';
                 if (msg.includes('failed to connect to')) {handleNotPaired(ipPort);}
+                else if (msg.includes('failed to authenticate to')) {handleAuthFailure(ipPort);}
                 else if (msg.includes('actively refused it') || msg.includes('cannot connect to')) {vscode.window.showErrorMessage(`ADB Connect failed: Connection refused.`);}
                 else {vscode.window.showErrorMessage(`Connection failed: ${msg}`);}
             }

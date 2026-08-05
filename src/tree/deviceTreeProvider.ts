@@ -10,11 +10,31 @@ export class DeviceTreeItem extends vscode.TreeItem {
         super(`${device.id} (${username || 'unknown'})`, vscode.TreeItemCollapsibleState.None);
 
         this.tooltip = `Device: ${device.id}\nStatus: ${device.status}${username ? '\nUser: ' + username : ''}`;
-        this.description = device.status;
         this.iconPath = new vscode.ThemeIcon('device-mobile');
         
-        // Context value for context menus
-        this.contextValue = 'adbDevice';
+        if (device.status === 'device') {
+            this.contextValue = 'adbDevice_device';
+            this.description = device.status;
+        } else if (device.status === 'unauthorized') {
+            this.contextValue = 'adbDevice_unauthorized';
+            this.description = 'unauthorized (Click to resolve)';
+            this.command = {
+                title: 'Handle Unauthorized Device',
+                command: 'remote-adb.handleUnauthorizedDevice',
+                arguments: [this]
+            };
+        } else if (device.status === 'offline') {
+            this.contextValue = 'adbDevice_offline';
+            this.description = 'offline (Click to resolve)';
+            this.command = {
+                title: 'Handle Offline Device',
+                command: 'remote-adb.handleOfflineDevice',
+                arguments: [this]
+            };
+        } else {
+            this.contextValue = `adbDevice_${device.status}`;
+            this.description = `${device.status} (Click to resolve)`;
+        }
     }
 }
 
