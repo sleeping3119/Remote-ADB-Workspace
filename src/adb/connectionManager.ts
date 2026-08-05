@@ -152,33 +152,48 @@ export class PersistentAdbShell {
     private processNext() {
         if (this.isBusy || this.commandQueue.length === 0) {return;}
         
-        this.isBusy = true;
         const next = this.commandQueue.shift()!;
-        this.currentResolve = next.resolve;
-        this.currentReject = next.reject;
         
-        if (next.isRaw) {
-            Logger.logCommand(`[Persistent Shell Raw] ${next.command}`);
-            this.process.stdin?.write(`${next.command}\n`);
-            
-            // For raw commands (like su or run-as), there is no EOF marker.
-            // We just wait a short time for the shell to process it, then resolve.
-            setTimeout(() => {
-                this.isBusy = false;
-                next.resolve('');
-                this.processNext();
-            }, 500);
+        if (this.isDead || !this.process.stdin?.writable) {
+            next.reject(new Error('ADB shell is dead or not writable'));
+            this.processNext();
             return;
         }
 
-        // Execute the command in a subshell or group to capture all output
-        // and echo the delimiter immediately after.
-        Logger.logCommand(`[Persistent Shell] ${next.command}`);
-        this.process.stdin?.write(`(${next.command}) 2>&1; echo __ADB_EOF__\n`);
+        this.isBusy = true;
+        this.currentResolve = next.resolve;
+        this.currentReject = next.reject;
+        
+        try {
+            if (next.isRaw) {
+                Logger.logCommand(`[Persistent Shell Raw] ${next.command}`);
+                this.process.stdin?.write(`${next.command}\n`);
+                
+                // For raw commands (like su or run-as), there is no EOF marker.
+                // We just wait a short time for the shell to process it, then resolve.
+                setTimeout(() => {
+                    this.isBusy = false;
+                    next.resolve('');
+                    this.processNext();
+                }, 500);
+                return;
+            }
+
+            // Execute the command in a subshell or group to capture all output
+            // and echo the delimiter immediately after.
+            Logger.logCommand(`[Persistent Shell] ${next.command}`);
+            this.process.stdin?.write(`(${next.command}) 2>&1; echo __ADB_EOF__\n`);
+        } catch (err: any) {
+            this.isBusy = false;
+            next.reject(new Error(`Failed to write to ADB shell: ${err.message}`));
+            this.processNext();
+        }
     }
     
     public close() {
-        this.process.kill();
+        if (!this.isDead) {
+            this.process.kill();
+        }
     }
 }
 
@@ -264,6 +279,9 @@ export class ConnectionManager {
             const adbPath = await this.toolsManager.getAdbPath();
             const shell = new PersistentAdbShell(adbPath, realId);
             
+            // Ensure shell is ready by waiting for a basic command to echo back
+            await shell.executeCommand('echo "ADB_INIT_OK"');
+            
             if (previousSwitchCommand) {
                 if (previousSwitchCommand.type === 'root') {
                     await shell.sendRawCommand('su');
@@ -273,6 +291,9 @@ export class ConnectionManager {
                     await shell.sendRawCommand(`run-as ${previousSwitchCommand.pkgName}`);
                 }
                 shell.activeSwitchCommand = previousSwitchCommand;
+                
+                // Ensure environment switch has settled before querying user
+                await new Promise(res => setTimeout(res, 200));
                 shell.refreshCurrentUser();
             }
             
