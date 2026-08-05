@@ -136,13 +136,15 @@ export async function activate(context: vscode.ExtensionContext) {
             Logger.logOutput(`[Extension Activate] No manifest available.`);
         }
         
-        // Trigger background cache initialization if manifest exists
         if (slimManifest) {
             // We do not await this so it runs in the background
             cacheManager.initializeCache(deviceId, slimManifest.workspaceRoot).catch(e => {
                 Logger.logError(`[Extension Activate] Cache initialization failed: ${e}`);
             });
         }
+        
+        // Ensure the Explorer view is brought to focus
+        vscode.commands.executeCommand('workbench.view.explorer');
         } finally {
             resolveInit();
         }
@@ -205,7 +207,9 @@ export async function activate(context: vscode.ExtensionContext) {
         const pwd = await shell.executeCommand('pwd');
         let initialPath = pwd.trim() || '/';
         const user = await shell.getCurrentUser();
-        if (user.name === 'shell' && initialPath === '/') {
+        if (shell.activeSwitchCommand?.type === 'termux') {
+            initialPath = '/data/user/0/com.termux/files/home/';
+        } else if (user.name === 'shell' && initialPath === '/') {
             initialPath = '/data/local/tmp';
         }
         const folderPath = await showFolderPicker(active, fsProvider, initialPath);
@@ -415,7 +419,9 @@ export async function activate(context: vscode.ExtensionContext) {
         const pwd = await shell.executeCommand('pwd');
         let initialPath = pwd.trim() || '/';
         const user = await shell.getCurrentUser();
-        if (user.name === 'shell' && initialPath === '/') {
+        if (shell.activeSwitchCommand?.type === 'termux') {
+            initialPath = '/data/user/0/com.termux/files/home/';
+        } else if (user.name === 'shell' && initialPath === '/') {
             initialPath = '/data/local/tmp';
         }
         const folderPath = await showFolderPicker(deviceItem.device.id, fsProvider, initialPath);

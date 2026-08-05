@@ -72,18 +72,18 @@ export class ValidationManager {
      * Triggers immediately after the user selects a folder.
      */
     public async validateWorkspace(deviceId: string, targetPath: string): Promise<ValidationManifest | undefined> {
-        return vscode.window.withProgress({
-            location: vscode.ProgressLocation.Notification,
-            title: `Validating ADB Workspace Path...`,
-            cancellable: true
-        }, async (progress, token) => {
-            const shell = await this.connectionManager.getPersistentShell(deviceId);
-            const currentUser = await shell.getCurrentUser();
-            const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+        const shell = await this.connectionManager.getPersistentShell(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
 
-            // Stage 0: Privilege Discovery
+        // Stage 0: Privilege Discovery
+        let isRootAvailable = false;
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Validating ADB Workspace...`,
+            cancellable: false
+        }, async (progress) => {
             progress.report({ message: 'Checking privileges...' });
-            let isRootAvailable = false;
             try {
                 const suCheck = await shell.executeCommand(`su -c id 2>/dev/null`);
                 if (suCheck.includes('uid=0(root)')) {
@@ -92,54 +92,57 @@ export class ValidationManager {
             } catch (e) {
                 // su not available
             }
+        });
 
-            // Stage 1: Target Folder Gatekeeper Check (!p Gatekeeper)
-            progress.report({ message: 'Verifying target folder permissions...' });
+        // Stage 1: Target Folder Gatekeeper Check (!p Gatekeeper)
+        const gateCheck = await shell.executeCommand(`[ -r "${targetPath}" ] && [ -x "${targetPath}" ] && echo "OK" || echo "FAIL"`);
+        if (gateCheck.trim() !== 'OK') {
+            // Target folder lacks permissions
+            const isTargetOwned = await this.checkOwnership(shell, prefix, targetPath, currentUser.name);
             
-            const gateCheck = await shell.executeCommand(`[ -r "${targetPath}" ] && [ -x "${targetPath}" ] && echo "OK" || echo "FAIL"`);
-            if (gateCheck.trim() !== 'OK') {
-                // Target folder lacks permissions
-                const isTargetOwned = await this.checkOwnership(shell, prefix, targetPath, currentUser.name);
-                
-                const actionLabel = 'Attempt Fix';
-                const cancelLabel = 'Abort';
-                let message = `The selected folder (${targetPath}) lacks permissions (needs r-x) to be opened as a workspace.`;
-                
-                const actions = [];
-                if (isTargetOwned || isRootAvailable) {
-                    actions.push(actionLabel);
-                }
-                actions.push(cancelLabel);
-
-                const userChoice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
-                
-                if (userChoice === actionLabel) {
-                    // Attempt to fix
-                    const chmodCmd = isRootAvailable 
-                        ? `su -c chmod a+rx "${targetPath}"` 
-                        : `${prefix} chmod a+rx "${targetPath}"`;
-                    await shell.executeCommand(chmodCmd);
-                    
-                    // Re-check
-                    const recheck = await shell.executeCommand(`[ -r "${targetPath}" ] && [ -x "${targetPath}" ] && echo "OK" || echo "FAIL"`);
-                    if (recheck.trim() !== 'OK') {
-                        vscode.window.showErrorMessage(`Target folder (${targetPath}) is blocked by system security policy and permissions cannot be changed.`);
-                        return undefined;
-                    }
-                } else {
-                    return undefined; // Abort
-                }
+            const actionLabel = 'Attempt Fix';
+            const cancelLabel = 'Abort';
+            let message = `The selected folder (${targetPath}) lacks permissions (needs r-x) to be opened as a workspace.`;
+            
+            const actions = [];
+            if (isTargetOwned || isRootAvailable) {
+                actions.push(actionLabel);
             }
+            actions.push(cancelLabel);
 
-            // Stage 2 & 3: Workspace Traversal & System Policy Testing
-            let nodes: NodeStatus[] = [];
-            let acceptedPaths = new Set<string>();
-            let attemptedPaths = new Set<string>(); // Tracks paths where chmod was attempted and failed
-            let isFirstScan = true;
-
-            while (true) {
-                progress.report({ message: 'Scanning workspace contents...' });
+            const userChoice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
+            
+            if (userChoice === actionLabel) {
+                // Attempt to fix
+                const chmodCmd = isRootAvailable 
+                    ? `su -c chmod a+rx "${targetPath}"` 
+                    : `${prefix} chmod a+rx "${targetPath}"`;
+                await shell.executeCommand(chmodCmd);
                 
+                // Re-check
+                const recheck = await shell.executeCommand(`[ -r "${targetPath}" ] && [ -x "${targetPath}" ] && echo "OK" || echo "FAIL"`);
+                if (recheck.trim() !== 'OK') {
+                    vscode.window.showErrorMessage(`Target folder (${targetPath}) is blocked by system security policy and permissions cannot be changed.`);
+                    return undefined;
+                }
+            } else {
+                return undefined; // Abort
+            }
+        }
+
+        // Stage 2 & 3: Workspace Traversal & System Policy Testing
+        let nodes: NodeStatus[] = [];
+        let acceptedPaths = new Set<string>();
+        let attemptedPaths = new Set<string>(); // Tracks paths where chmod was attempted and failed
+        let isFirstScan = true;
+
+        while (true) {
+            let scanAborted = false;
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: 'Scanning workspace contents...',
+                cancellable: true
+            }, async (progress, token) => {
                 // Threshold Check only on first loop
                 if (isFirstScan) {
                     isFirstScan = false;
@@ -151,74 +154,86 @@ export class ValidationManager {
                             `This folder contains ${fileCount} items. Scanning permissions might take a while. Proceed?`,
                             'Proceed', 'Cancel'
                         );
-                        if (proceed !== 'Proceed') return undefined;
-                    }
-                }
-
-                nodes = await this.traverseAndEvaluate(shell, prefix, targetPath, isRootAvailable);
-                if (token.isCancellationRequested) return undefined;
-
-                const inaccessible: NodeStatus[] = [];
-                const readOnly: NodeStatus[] = [];
-
-                for (const node of nodes) {
-                    if (acceptedPaths.has(node.path)) continue;
-
-                    // If this path was already attempted and failed, mark it as non-remediable
-                    // so it still shows in the UI but can't be retried
-                    if (attemptedPaths.has(node.path)) {
-                        node.isRemediable = false;
-                    }
-
-                    if (node.category === 'INACCESSIBLE') inaccessible.push(node);
-                    else if (node.category === 'READ_ONLY') readOnly.push(node);
-                }
-
-                if (inaccessible.length === 0 && readOnly.length === 0) {
-                    break; // All clear!
-                }
-
-                // Stage 4: Pre-flight Summary UI
-                const uiResult = await showValidationSummaryUI({
-                    inaccessible,
-                    readOnly,
-                    targetPath
-                });
-
-                if (!uiResult || uiResult.action === 'abort') {
-                    return undefined;
-                }
-
-                if (uiResult.action === 'skip') {
-                    // User accepts the current state for all remaining items
-                    for (const node of inaccessible) acceptedPaths.add(node.path);
-                    for (const node of readOnly) acceptedPaths.add(node.path);
-                    break;
-                }
-
-                // Stage 5: Remediation Execution
-                if (uiResult.action === 'fix_all' || uiResult.action === 'fix_selected') {
-                    progress.report({ message: 'Applying permissions...' });
-                    
-                    const nodesToFix = uiResult.action === 'fix_all' 
-                        ? [...inaccessible, ...readOnly].filter(n => n.isRemediable)
-                        : uiResult.selectedNodesToFix || [];
-
-                    // If they chose fix_all, unselected items (unfixable) are accepted.
-                    // If they chose fix_selected, we ONLY focus on the selected item, rest stay pending!
-                    if (uiResult.action === 'fix_all') {
-                        for (const node of [...inaccessible, ...readOnly]) {
-                            if (!nodesToFix.includes(node)) {
-                                acceptedPaths.add(node.path);
-                            }
+                        if (proceed !== 'Proceed') {
+                            scanAborted = true;
+                            return;
                         }
                     }
+                }
 
-                    if (nodesToFix.length === 0) {
-                        // Nothing to fix — loop will re-show UI with same items (all non-remediable)
-                        continue;
+                if (!scanAborted) {
+                    nodes = await this.traverseAndEvaluate(shell, prefix, targetPath, isRootAvailable);
+                }
+                
+                if (token.isCancellationRequested) scanAborted = true;
+            });
+            
+            if (scanAborted) return undefined;
+
+            const inaccessible: NodeStatus[] = [];
+            const readOnly: NodeStatus[] = [];
+
+            for (const node of nodes) {
+                if (acceptedPaths.has(node.path)) continue;
+
+                // If this path was already attempted and failed, mark it as non-remediable
+                // so it still shows in the UI but can't be retried
+                if (attemptedPaths.has(node.path)) {
+                    node.isRemediable = false;
+                }
+
+                if (node.category === 'INACCESSIBLE') inaccessible.push(node);
+                else if (node.category === 'READ_ONLY') readOnly.push(node);
+            }
+
+            if (inaccessible.length === 0 && readOnly.length === 0) {
+                break; // All clear!
+            }
+
+            // Stage 4: Pre-flight Summary UI
+            const uiResult = await showValidationSummaryUI({
+                inaccessible,
+                readOnly,
+                targetPath
+            });
+
+            if (!uiResult || uiResult.action === 'abort') {
+                return undefined;
+            }
+
+            if (uiResult.action === 'skip') {
+                // User accepts the current state for all remaining items
+                for (const node of inaccessible) acceptedPaths.add(node.path);
+                for (const node of readOnly) acceptedPaths.add(node.path);
+                break;
+            }
+
+            // Stage 5: Remediation Execution
+            if (uiResult.action === 'fix_all' || uiResult.action === 'fix_selected') {
+                const nodesToFix = uiResult.action === 'fix_all' 
+                    ? [...inaccessible, ...readOnly].filter(n => n.isRemediable)
+                    : uiResult.selectedNodesToFix || [];
+
+                // If they chose fix_all, unselected items (unfixable) are accepted.
+                // If they chose fix_selected, we ONLY focus on the selected item, rest stay pending!
+                if (uiResult.action === 'fix_all') {
+                    for (const node of [...inaccessible, ...readOnly]) {
+                        if (!nodesToFix.includes(node)) {
+                            acceptedPaths.add(node.path);
+                        }
                     }
+                }
 
+                if (nodesToFix.length === 0) {
+                    // Nothing to fix — loop will re-show UI with same items (all non-remediable)
+                    continue;
+                }
+
+                await vscode.window.withProgress({
+                    location: vscode.ProgressLocation.Notification,
+                    title: 'Applying permissions...',
+                    cancellable: false
+                }, async () => {
                     for (const node of nodesToFix) {
                         const chmodCmd = this.buildChmodCommand(node, uiResult.applyRecursively || false, isRootAvailable, prefix);
                         Logger.logOutput(`[Validation] Running: ${chmodCmd}`);
@@ -249,35 +264,37 @@ export class ValidationManager {
                             Logger.logOutput(`[Validation] Fix failed for ${node.path} — will show as non-remediable`);
                         }
                     }
-                    // Loop restarts: re-scans and re-shows UI.
-                    // Fixed nodes will now pass. Failed nodes show as non-remediable.
-                }
+                });
+                // Loop restarts: re-scans and re-shows UI.
+                // Fixed nodes will now pass. Failed nodes show as non-remediable.
             }
+        }
 
-            // Stage 6: Validation Manifest Construction
-            const finalFullAccess: string[] = [];
-            const finalReadOnly: string[] = [];
-            const finalSkipped: string[] = [];
+        // Stage 6: Validation Manifest Construction
+        const finalFullAccess: string[] = [];
+        const finalReadOnly: string[] = [];
+        const finalSkipped: string[] = [];
 
-            for (const node of nodes) {
-                if (node.category === 'FULL_ACCESS') finalFullAccess.push(node.path);
-                else if (node.category === 'READ_ONLY') finalReadOnly.push(node.path);
-                else if (node.category === 'INACCESSIBLE') finalSkipped.push(node.path);
+        for (const node of nodes) {
+            if (node.category === 'FULL_ACCESS') finalFullAccess.push(node.path);
+            else if (node.category === 'READ_ONLY') finalReadOnly.push(node.path);
+            else if (node.category === 'INACCESSIBLE') finalSkipped.push(node.path);
+        }
+
+        const manifest: ValidationManifest = {
+            workspaceRoot: targetPath,
+            fullAccess: finalFullAccess,
+            readOnly: finalReadOnly,
+            skipped: Array.from(attemptedPaths).filter(p => !acceptedPaths.has(p)),
+            privilegeContext: {
+                user: currentUser.name,
+                groups: currentUser.groups,
+                isRootAvailable,
+                switchCommand: shell.activeSwitchCommand
             }
+        };
 
-            return {
-                workspaceRoot: targetPath,
-                fullAccess: finalFullAccess,
-                readOnly: finalReadOnly,
-                skipped: Array.from(attemptedPaths).filter(p => !acceptedPaths.has(p)),
-                privilegeContext: {
-                    user: currentUser.name,
-                    groups: currentUser.groups,
-                    isRootAvailable,
-                    switchCommand: shell.activeSwitchCommand
-                }
-            };
-        });
+        return manifest;
     }
 
     private async checkOwnership(shell: PersistentAdbShell, prefix: string, targetPath: string, currentUsername: string): Promise<boolean> {
