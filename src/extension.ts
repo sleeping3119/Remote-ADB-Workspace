@@ -137,33 +137,43 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         
         if (slimManifest) {
+            const createProfile = async () => {
+                const adbPath = await toolsManager.getAdbPath();
+                const root = slimManifest.workspaceRoot;
+                let shellCmd = `cd '${root}' && exec sh`;
+                const switchCmd = slimManifest.switchCommand;
+                
+                if (switchCmd && switchCmd.type !== 'shell') {
+                    if (switchCmd.type === 'termux') {
+                        shellCmd = `run-as com.termux sh -c "cd '${root}' && exec bash"`;
+                    } else if (switchCmd.type === 'custom') {
+                        shellCmd = `run-as ${switchCmd.pkgName} sh -c "cd '${root}' && exec sh"`;
+                    } else if (switchCmd.type === 'root') {
+                        shellCmd = `su -c "cd '${root}' && exec sh"`;
+                    }
+                }
+
+                return new vscode.TerminalProfile({
+                    name: 'ADB Shell',
+                    shellPath: adbPath,
+                    shellArgs: ['-s', deviceId, 'shell', '-t', shellCmd],
+                    iconPath: new vscode.ThemeIcon('terminal-linux')
+                });
+            };
+
             context.subscriptions.push(vscode.window.registerTerminalProfileProvider('remote-adb.terminalProfile', {
                 provideTerminalProfile(token: vscode.CancellationToken): vscode.ProviderResult<vscode.TerminalProfile> {
-                    return (async () => {
-                        const adbPath = await toolsManager.getAdbPath();
-                        const root = slimManifest.workspaceRoot;
-                        let shellCmd = `cd '${root}' && exec sh`;
-                        const switchCmd = slimManifest.switchCommand;
-                        
-                        if (switchCmd && switchCmd.type !== 'shell') {
-                            if (switchCmd.type === 'termux') {
-                                shellCmd = `run-as com.termux sh -c "cd '${root}' && exec bash"`;
-                            } else if (switchCmd.type === 'custom') {
-                                shellCmd = `run-as ${switchCmd.pkgName} sh -c "cd '${root}' && exec sh"`;
-                            } else if (switchCmd.type === 'root') {
-                                shellCmd = `su -c "cd '${root}' && exec sh"`;
-                            }
-                        }
-
-                        return new vscode.TerminalProfile({
-                            name: 'ADB Shell',
-                            shellPath: adbPath,
-                            shellArgs: ['-s', deviceId, 'shell', '-t', shellCmd],
-                            iconPath: new vscode.ThemeIcon('terminal-linux')
-                        });
-                    })();
+                    return createProfile();
                 }
             }));
+
+            // Automatically open the terminal when workspace starts
+            createProfile().then(profile => {
+                const terminal = vscode.window.createTerminal(profile.options as vscode.TerminalOptions);
+                terminal.show();
+            }).catch(e => {
+                Logger.logError(`[Extension Activate] Failed to auto-start terminal: ${e}`);
+            });
 
             // We do not await this so it runs in the background
             cacheManager.initializeCache(deviceId, slimManifest.workspaceRoot).catch(e => {
@@ -232,7 +242,7 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         
         const shell = await connectionManager.getPersistentShell(active);
-        const pwd = await shell.executeCommand('pwd');
+        const pwd = await shell.executeCommand('pwd');4
         let initialPath = pwd.trim() || '/';
         const user = await shell.getCurrentUser();
         if (shell.activeSwitchCommand?.type === 'termux') {
