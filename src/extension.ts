@@ -140,23 +140,25 @@ export async function activate(context: vscode.ExtensionContext) {
             const createProfile = async () => {
                 const adbPath = await toolsManager.getAdbPath();
                 const root = slimManifest.workspaceRoot;
-                let shellCmd = `cd '${root}' && exec sh`;
+                let shellArgs = ['-s', deviceId, 'shell', '-t'];
                 const switchCmd = slimManifest.switchCommand;
                 
                 if (switchCmd && switchCmd.type !== 'shell') {
                     if (switchCmd.type === 'termux') {
-                        shellCmd = `run-as com.termux sh -c "cd '${root}' && exec bash"`;
+                        shellArgs.push('run-as', 'com.termux', 'sh', '-c', `cd '${root}' && exec bash`);
                     } else if (switchCmd.type === 'custom') {
-                        shellCmd = `run-as ${switchCmd.pkgName} sh -c "cd '${root}' && exec sh"`;
+                        shellArgs.push('run-as', switchCmd.pkgName!, 'sh', '-c', `cd '${root}' && exec sh`);
                     } else if (switchCmd.type === 'root') {
-                        shellCmd = `su -c "cd '${root}' && exec sh"`;
+                        shellArgs.push('su', '-c', `cd '${root}' && exec sh`);
                     }
+                } else {
+                    shellArgs.push('sh', '-c', `cd '${root}' && exec sh`);
                 }
 
                 return new vscode.TerminalProfile({
                     name: 'ADB Shell',
                     shellPath: adbPath,
-                    shellArgs: ['-s', deviceId, 'shell', '-t', shellCmd],
+                    shellArgs: shellArgs,
                     iconPath: new vscode.ThemeIcon('terminal-linux')
                 });
             };
