@@ -145,7 +145,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 
                 if (switchCmd && switchCmd.type !== 'shell') {
                     if (switchCmd.type === 'termux') {
-                        shellArgs.push('run-as', 'com.termux', 'sh', '-c', `cd '${root}' && exec bash`);
+                        shellArgs.push('run-as', 'com.termux', 'sh', '-c', `cd '${root}' && exec sh`);
                     } else if (switchCmd.type === 'custom') {
                         shellArgs.push('run-as', switchCmd.pkgName!, 'sh', '-c', `cd '${root}' && exec sh`);
                     } else if (switchCmd.type === 'root') {
