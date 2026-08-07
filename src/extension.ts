@@ -149,7 +149,7 @@ export async function activate(context: vscode.ExtensionContext) {
                     } else if (switchCmd.type === 'custom') {
                         shellArgs.push('run-as', switchCmd.pkgName!, 'sh', '-c', `\"cd '${root}' && exec sh\"`);
                     } else if (switchCmd.type === 'root') {
-                        shellArgs.push('su', '-c', `\"cd '${root}' && exec sh\"`);
+                        shellArgs.push('su');
                     }
                 } else {
                     shellArgs.push('sh', '-c', `\"cd '${root}' && exec sh\"`);
@@ -176,6 +176,14 @@ export async function activate(context: vscode.ExtensionContext) {
             }).catch(e => {
                 Logger.logError(`[Extension Activate] Failed to auto-start terminal: ${e}`);
             });
+
+            // Listen for newly opened ADB Shell terminals to inject root commands
+            context.subscriptions.push(vscode.window.onDidOpenTerminal(terminal => {
+                if (terminal.name === 'ADB Shell' && slimManifest.switchCommand?.type === 'root') {
+                    // Send the directory change command directly to the interactive root shell
+                    terminal.sendText(`cd '${slimManifest.workspaceRoot}' && clear`);
+                }
+            }));
 
             // We do not await this so it runs in the background
             cacheManager.initializeCache(deviceId, slimManifest.workspaceRoot).catch(e => {
