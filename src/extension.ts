@@ -7,6 +7,7 @@ import { AdbFileSystemProvider } from './fs/adbFileSystemProvider';
 import { Logger } from './logger';
 import { DeviceTreeProvider, DeviceTreeItem } from './tree/deviceTreeProvider';
 import { showFolderPicker, triggerAcceptFolderPicker } from './ui/folderPicker';
+import { showFilePicker, triggerAcceptFilePicker } from './ui/filePicker';
 import { ValidationManager } from './adb/validationManager';
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -243,16 +244,30 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     }));
 
+    context.subscriptions.push(vscode.commands.registerCommand('remote-adb.acceptFilePicker', () => {
+        if (triggerAcceptFilePicker) {
+            triggerAcceptFilePicker();
+        }
+    }));
+
     // Command: Open Folder
     let openFolderDisposable = vscode.commands.registerCommand('remote-adb.openFolder', async (deviceItem?: DeviceTreeItem) => {
         let active = deviceItem ? deviceItem.device.id : connectionManager.getActiveDevice();
         if (!active) {
-            vscode.window.showErrorMessage('No active device selected. Connect or select a device first.');
-            return;
+            const devices = await connectionManager.getDevices();
+            const connected = devices.filter(d => d.status === 'device');
+            if (connected.length > 0) {
+                active = connected[0].id;
+                connectionManager.setActiveDevice(active);
+                updateStatusBar();
+            } else {
+                vscode.window.showErrorMessage('No connected device. Connect a device first.');
+                return;
+            }
         }
         
         const shell = await connectionManager.getPersistentShell(active);
-        const pwd = await shell.executeCommand('pwd');4
+        const pwd = await shell.executeCommand('pwd');
         let initialPath = pwd.trim() || '/';
         const user = await shell.getCurrentUser();
         if (shell.activeSwitchCommand?.type === 'termux') {
@@ -298,6 +313,45 @@ export async function activate(context: vscode.ExtensionContext) {
             );
         }
     });
+
+    // Command: Open File
+    let openFileDisposable = vscode.commands.registerCommand('remote-adb.openFile', async (deviceItem?: DeviceTreeItem) => {
+        let active = deviceItem ? deviceItem.device.id : connectionManager.getActiveDevice();
+        if (!active) {
+            const devices = await connectionManager.getDevices();
+            const connected = devices.filter(d => d.status === 'device');
+            if (connected.length > 0) {
+                active = connected[0].id;
+                connectionManager.setActiveDevice(active);
+                updateStatusBar();
+            } else {
+                vscode.window.showErrorMessage('No connected device. Connect a device first.');
+                return;
+            }
+        }
+        
+        const shell = await connectionManager.getPersistentShell(active);
+        const pwd = await shell.executeCommand('pwd');
+        let initialPath = pwd.trim() || '/';
+        const user = await shell.getCurrentUser();
+        if (shell.activeSwitchCommand?.type === 'termux') {
+            initialPath = '/data/user/0/com.termux/files/home/';
+        } else if (user.name === 'shell' && initialPath === '/') {
+            initialPath = '/data/local/tmp';
+        }
+        const filePath = await showFilePicker(active, fsProvider, initialPath);
+        if (filePath) {
+            const isValid = await validationManager.validateFile(active, filePath);
+            if (!isValid) {
+                return;
+            }
+            
+            const uri = vscode.Uri.parse(`remote-adb://${active}${filePath}`);
+            vscode.commands.executeCommand('vscode.open', uri);
+        }
+    });
+
+    context.subscriptions.push(openFolderDisposable, openFileDisposable);
 
     context.subscriptions.push(vscode.commands.registerCommand('remote-adb.handleUnauthorizedDevice', async (item: DeviceTreeItem) => {
         if (!item || !item.device) return;
@@ -402,16 +456,25 @@ export async function activate(context: vscode.ExtensionContext) {
             shell.refreshCurrentUser();
         }
 
-        await shell.sendRawCommand('su');
-        shell.refreshCurrentUser();
-        user = await shell.getCurrentUser();
-        if (user.name !== 'root') {
-            await shell.sendRawCommand('exit');
-            vscode.window.showErrorMessage('Failed to switch to root. Device might not be rooted.');
-        } else {
-            shell.activeSwitchCommand = { type: 'root' };
-            vscode.window.showInformationMessage('Switched to root');
-            vscode.commands.executeCommand('remote-adb.refreshDevices');
+        try {
+            await shell.sendRawCommand('su');
+            shell.refreshCurrentUser();
+            user = await shell.getCurrentUser();
+            if (user.name !== 'root') {
+                await shell.sendRawCommand('exit');
+                vscode.window.showErrorMessage('Device is unrooted. Failed to switch to root.');
+            } else {
+                shell.activeSwitchCommand = { type: 'root' };
+                vscode.window.showInformationMessage('Switched to root');
+                vscode.commands.executeCommand('remote-adb.refreshDevices');
+            }
+        } catch (error: any) {
+            // Unrooted devices often kill the shell or exit immediately when 'su' is executed
+            if (error.message && error.message.includes('ADB shell closed')) {
+                vscode.window.showErrorMessage('Device is unrooted.');
+            } else {
+                vscode.window.showErrorMessage(`Failed to switch to root: ${error.message}`);
+            }
         }
     }));
 

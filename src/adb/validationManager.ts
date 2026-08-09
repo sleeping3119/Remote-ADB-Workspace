@@ -62,9 +62,85 @@ export class ValidationManager {
     private connectionManager: ConnectionManager;
     private toyboxManager: ToyboxManager;
 
+
     constructor(connectionManager: ConnectionManager, toyboxManager: ToyboxManager) {
         this.connectionManager = connectionManager;
         this.toyboxManager = toyboxManager;
+    }
+
+    /**
+     * Entry point for single file validation.
+     * Triggers when the user selects a file from the file picker.
+     */
+    public async validateFile(deviceId: string, targetPath: string): Promise<boolean> {
+        const shell = await this.connectionManager.getPersistentShell(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+
+        let isRootAvailable = false;
+        await vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `Validating ADB File...`,
+            cancellable: false
+        }, async (progress) => {
+            progress.report({ message: 'Checking privileges...' });
+            try {
+                const suCheck = await shell.executeCommand(`su -c id 2>/dev/null`);
+                if (suCheck.includes('uid=0(root)')) {
+                    isRootAvailable = true;
+                }
+            } catch (e) {
+                // su not available
+            }
+        });
+
+        // Check if file is readable and writable
+        const checkCmd = `[ -r "${targetPath}" ] && [ -w "${targetPath}" ] && echo "RW" || ([ -r "${targetPath}" ] && echo "R" || echo "FAIL")`;
+        const gateCheck = await shell.executeCommand(checkCmd);
+        const result = gateCheck.trim();
+
+        if (result !== 'RW') {
+            const isTargetOwned = await this.checkOwnership(shell, prefix, targetPath, currentUser.name);
+            
+            const actionLabel = 'Attempt Fix';
+            const skipLabel = 'Skip / Open Anyway';
+            const cancelLabel = 'Abort';
+            let message = result === 'R' 
+                ? `The selected file (${targetPath}) is read-only. Would you like to attempt to make it writable?` 
+                : `The selected file (${targetPath}) lacks read access. Would you like to attempt to fix it?`;
+            
+            const actions = [];
+            if (isTargetOwned || isRootAvailable) {
+                actions.push(actionLabel);
+            }
+            actions.push(skipLabel);
+            actions.push(cancelLabel);
+
+            const userChoice = await vscode.window.showWarningMessage(message, { modal: true }, ...actions);
+            
+            if (userChoice === actionLabel) {
+                // Attempt to fix
+                const chmodCmd = isRootAvailable 
+                    ? `su -c chmod a+rw "${targetPath}"` 
+                    : `${prefix} chmod a+rw "${targetPath}"`;
+                await shell.executeCommand(chmodCmd);
+                
+                // Re-check read permission as a baseline
+                const recheck = await shell.executeCommand(`[ -r "${targetPath}" ] && echo "OK" || echo "FAIL"`);
+                if (recheck.trim() !== 'OK') {
+                    vscode.window.showErrorMessage(`Target file (${targetPath}) is blocked by system security policy and permissions cannot be changed.`);
+                    // Even if blocked, if they chose to fix we fail if it still can't be read.
+                    return false;
+                }
+                return true;
+            } else if (userChoice === skipLabel) {
+                return true;
+            } else {
+                return false; // Abort
+            }
+        }
+
+        return true;
     }
 
     /**

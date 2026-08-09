@@ -229,11 +229,42 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         
         // 2. Resolve workspace folder to use cache
         const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
-        const workspaceRoot = workspaceFolder ? workspaceFolder.uri.path : "/";
+        
+        if (!workspaceFolder) {
+            // Standalone file opened via file picker (not part of workspace)
+            // It might require root privileges to read (if user switched to root), 
+            // so we must copy it to a world-readable tmp directory first using the persistent shell!
+            const rawFolder = await this.toyboxManager.getRawFolderPath(deviceId, 'shell');
+            const tempRawFileName = 'pull_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+            const safeTempRawPath = escapePath(path.posix.join(rawFolder, tempRawFileName));
+            
+            // Use the persistent shell to copy the file to the temp path and make it readable for adb pull
+            const cpCmd = `cp "${safePath}" "${safeTempRawPath}" && chmod 666 "${safeTempRawPath}" 2>&1 && echo "OK" || echo "ERR:$?"`;
+            const cpOutput = (await shell.executeCommand(cpCmd)).trim();
+            if (!cpOutput.endsWith("OK")) {
+                throw vscode.FileSystemError.Unavailable(`Failed to stage file for reading: ${cpOutput.replace('ERR', '').trim()}`);
+            }
+
+            const crypto = require('crypto');
+            const os = require('os');
+            const tempFilePath = path.join(os.tmpdir(), `adb_temp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
+            const safeTempFile = escapePath(tempFilePath);
+            try {
+                await this.connectionManager.executeCommandForDevice(deviceId, `pull "${safeTempRawPath}" "${safeTempFile}"`);
+                const content = await fs.promises.readFile(tempFilePath);
+                return content;
+            } finally {
+                if (fs.existsSync(tempFilePath)) {
+                    await fs.promises.unlink(tempFilePath).catch(() => {});
+                }
+                // Cleanup remote temp file using adb shell directly (runs as shell)
+                await this.connectionManager.executeCommandForDevice(deviceId, `shell rm -f "${safeTempRawPath}"`).catch(() => {});
+            }
+        }
+
+        const workspaceRoot = workspaceFolder.uri.path;
         const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceRoot);
-        const relativePath = workspaceFolder 
-            ? targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '')
-            : targetPath.replace(/^\/+/, '');
+        const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
         const cachedFilePath = path.join(cacheDir, relativePath);
 
         const parts = lastLine.split('|');
@@ -282,7 +313,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         }
 
         // Check if it exists in cache
-        if (!fs.existsSync(cachedFilePath) && workspaceFolder) {
+        if (!fs.existsSync(cachedFilePath)) {
             // Not in cache, pull using tar
             await this.cacheManager.pullFileToCache(deviceId, workspaceFolder.uri.path, relativePath);
         }
@@ -334,18 +365,14 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         
         // Resolve cache file path
         const workspaceFolder = vscode.workspace.workspaceFolders?.find(f => targetPath.startsWith(f.uri.path));
-        const workspaceRoot = workspaceFolder ? workspaceFolder.uri.path : "/";
-        const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceRoot);
-        const relativePath = workspaceFolder 
-            ? targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '')
-            : targetPath.replace(/^\/+/, '');
-        const cachedFilePath = path.join(cacheDir, relativePath);
         
         // Calculate local hash of the new content being saved
         const localHash = crypto.createHash('md5').update(content).digest('hex');
 
-        // OPTIMISTIC CONCURRENCY CONTROL
+        // OPTIMISTIC CONCURRENCY CONTROL (workspace only)
         if (!options.create && workspaceFolder) {
+            const workspaceRoot = workspaceFolder.uri.path;
+            const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
             const baseline = this.cacheManager.getBaseline(deviceId, workspaceRoot, relativePath);
             if (baseline) {
                 const currentUser = await shell.getCurrentUser();
@@ -384,35 +411,54 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         
         try {
             if (content.byteLength > 0 || !options.create) {
-                // Write directly to our local cache file
-                await fs.promises.mkdir(path.dirname(cachedFilePath), { recursive: true });
-                await fs.promises.writeFile(cachedFilePath, content);
+                let localFileToPush: string;
+                let tempFilePathToCleanup: string | undefined;
+
+                if (workspaceFolder) {
+                    const workspaceRoot = workspaceFolder.uri.path;
+                    const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
+                    const cacheDir = this.cacheManager.getCacheDir(deviceId, workspaceRoot);
+                    const cachedFilePath = path.join(cacheDir, relativePath);
+                    
+                    await fs.promises.mkdir(path.dirname(cachedFilePath), { recursive: true });
+                    await fs.promises.writeFile(cachedFilePath, content);
+                    localFileToPush = cachedFilePath;
+                } else {
+                    const crypto = require('crypto');
+                    const os = require('os');
+                    const tempFilePath = path.join(os.tmpdir(), `adb_temp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
+                    await fs.promises.writeFile(tempFilePath, content);
+                    localFileToPush = tempFilePath;
+                    tempFilePathToCleanup = tempFilePath;
+                }
 
                 // Push to .raw folder first, then cat into targetPath to follow symlinks safely
-                // We use 'shell' as the user for getRawFolderPath so it returns the global raw folder 
-                // (/data/local/tmp/.raw). ADB host pushes as 'shell', so it needs access to this directory.
                 const rawFolder = await this.toyboxManager.getRawFolderPath(deviceId, 'shell');
                 const tempRawFileName = 'push_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
                 const tempRawPath = path.posix.join(rawFolder, tempRawFileName);
                 
-                const safeCachedFile = escapePath(cachedFilePath);
+                const safeLocalFile = escapePath(localFileToPush);
                 const safeTempRawPath = escapePath(tempRawPath);
                 
-                await this.connectionManager.executeCommandForDevice(deviceId, `push "${safeCachedFile}" "${safeTempRawPath}"`);
+                await this.connectionManager.executeCommandForDevice(deviceId, `push "${safeLocalFile}" "${safeTempRawPath}"`);
                 
                 const catCmd = `cat "${safeTempRawPath}" > "${safeTargetPath}" 2>&1 && echo "OK" || echo "ERR:$?"`;
                 const catOutput = (await shell.executeCommand(catCmd)).trim();
                 
-                // The temp file was pushed by the adb shell user, so the run-as app user lacks permission to delete it.
-                // We delete it using the adb shell directly.
                 await this.connectionManager.executeCommandForDevice(deviceId, `shell rm -f "${safeTempRawPath}"`).catch(() => {});
                 
+                if (tempFilePathToCleanup && fs.existsSync(tempFilePathToCleanup)) {
+                    await fs.promises.unlink(tempFilePathToCleanup).catch(() => {});
+                }
+
                 if (!catOutput.endsWith("OK")) {
                     throw vscode.FileSystemError.Unavailable(`Failed to save file remotely: ${catOutput.replace('ERR', '').trim()}`);
                 }
                 
                 // Update baseline after successful write
                 if (workspaceFolder) {
+                    const workspaceRoot = workspaceFolder.uri.path;
+                    const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
                     const currentUser = await shell.getCurrentUser();
                     const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
                     const statCmd = `${prefix} stat -c "%Y %s" "${safeTargetPath}"`;
@@ -657,6 +703,88 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             
             const type = perms[0] === 'd' ? vscode.FileType.Directory : vscode.FileType.SymbolicLink;
             const accessible = this.isAccessibleFolderPicker(perms, owner, group, currentUser);
+            
+            entries.push({ name, type, accessible });
+        }
+        
+        return entries;
+    }
+
+    private isAccessibleFilePicker(perms: string, owner: string, group: string, user: { name: string, groups: string[] }, isDir: boolean): boolean {
+        if (user.name === 'root') return true;
+        
+        let rIndex = 7;
+        let wIndex = 8;
+        let xIndex = 9;
+        
+        if (user.name === owner) {
+            rIndex = 1; wIndex = 2; xIndex = 3;
+        } else if (user.groups.includes(group) || group === 'everybody') {
+            rIndex = 4; wIndex = 5; xIndex = 6;
+        }
+        
+        if (isDir) {
+            return perms[rIndex] === 'r' && (perms[xIndex] === 'x' || perms[xIndex] === 's' || perms[xIndex] === 't');
+        } else {
+            return perms[rIndex] === 'r' && perms[wIndex] === 'w';
+        }
+    }
+
+    public async readFilePickerDirectoryWithPermissions(uri: vscode.Uri): Promise<AdbDirEntry[]> {
+        const deviceId = await this.connectionManager.resolveDeviceId(uri.authority);
+        const targetPath = uri.path;
+        
+        const shell = await this.connectionManager.getPersistentShell(deviceId);
+        const currentUser = await shell.getCurrentUser();
+        const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+        
+        const safePath = escapePath(targetPath);
+        // toybox ls -l prints detailed format. We filter for files '-', directories 'd' and symlinks 'l'
+        const output = await shell.executeCommand(`${prefix} ls -l "${safePath}" | ${prefix} grep '^[-dl]'`);
+        
+        if (output.includes('Permission denied')) {
+            throw vscode.FileSystemError.NoPermissions(uri);
+        }
+        if (output.includes('No such file')) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        
+        const entries: AdbDirEntry[] = [];
+        const lines = output.split('\n');
+        
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            
+            const parts = trimmed.split(/\s+/);
+            if (parts.length < 7) continue;
+            
+            const perms = parts[0];
+            const owner = parts[2];
+            const group = parts[3];
+            
+            let nameIndex = 7;
+            if (parts[6] && !parts[6].includes(':') && !parts[5].includes(':')) {
+            }
+            for (let i = 4; i < parts.length; i++) {
+                if (parts[i].includes(':')) {
+                    nameIndex = i + 1;
+                    break;
+                }
+            }
+            
+            let name = parts.slice(nameIndex).join(' ');
+            
+            if (perms[0] === 'l' && name.includes(' -> ')) {
+                name = name.split(' -> ')[0];
+            }
+            
+            if (name === '.' || name === '..' || name === '/' || name.includes('/')) continue;
+            if (perms.includes('?')) continue;
+            
+            const isDir = perms[0] === 'd';
+            const type = isDir ? vscode.FileType.Directory : (perms[0] === 'l' ? vscode.FileType.SymbolicLink : vscode.FileType.File);
+            const accessible = this.isAccessibleFilePicker(perms, owner, group, currentUser, isDir);
             
             entries.push({ name, type, accessible });
         }

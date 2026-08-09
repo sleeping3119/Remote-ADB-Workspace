@@ -85,6 +85,15 @@
       {
         "command": "remote-adb.acceptFolderPicker",
         "title": "Accept Folder Picker"
+      },
+      {
+        "command": "remote-adb.openFile",
+        "title": "Remote ADB: Open File",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "remote-adb.acceptFilePicker",
+        "title": "Accept File Picker"
       }
     ],
     "viewsContainers": {
@@ -119,9 +128,14 @@
           "group": "inline"
         },
         {
-          "command": "remote-adb.openInNewWindow",
+          "command": "remote-adb.openFile",
           "when": "view == remote-adb.devicesView && viewItem == adbDevice_device",
           "group": "inline"
+        },
+        {
+          "command": "remote-adb.openInNewWindow",
+          "when": "view == remote-adb.devicesView && viewItem == adbDevice_device",
+          "group": "1_open@2"
         },
         {
           "command": "remote-adb.switchUserRoot",
@@ -150,6 +164,11 @@
         "command": "remote-adb.acceptFolderPicker",
         "key": "shift+enter",
         "when": "inQuickOpen && remoteAdbFolderPickerActive"
+      },
+      {
+        "command": "remote-adb.acceptFilePicker",
+        "key": "shift+enter",
+        "when": "inQuickOpen && remoteAdbFilePickerActive"
       }
     ],
     "configuration": {
