@@ -380,6 +380,19 @@ export class ConnectionManager {
         return this.pendingGetDevices;
     }
 
+    public async waitForDeviceReady(deviceId: string, timeoutMs: number = 10000): Promise<boolean> {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            const devices = await this.getDevices();
+            const device = devices.find(d => d.id === deviceId);
+            if (device && device.status === 'device') {
+                return true;
+            }
+            await new Promise(res => setTimeout(res, 1000));
+        }
+        return false;
+    }
+
     public async executeCommandForDevice(deviceId: string, args: string): Promise<string> {
         const realId = await this.resolveDeviceId(deviceId);
         return this.executeAdbCommand(`-s ${realId} ${args}`);
@@ -395,6 +408,10 @@ export class ConnectionManager {
 
     public async killServer(): Promise<string> {
         return this.executeAdbCommand(`kill-server`);
+    }
+
+    public async startServer(): Promise<string> {
+        return this.executeAdbCommand(`start-server`);
     }
 
     public async pair(ipPort: string, code: string): Promise<string> {
@@ -419,9 +436,16 @@ export class ConnectionManager {
         // Only log devices command if we really want to, but it's debounced now.
         Logger.logCommand(cmd);
         return new Promise((resolve, reject) => {
-            const timeout = args === 'devices' ? 5000 : 0;
+            let timeout = 0;
+            if (args.startsWith('connect ') || args.startsWith('disconnect ') || args === 'kill-server' || args === 'start-server') {
+                timeout = 15000;
+            } else if (args === 'devices') {
+                timeout = 5000;
+            }
+            
             cp.exec(cmd, { timeout }, (error, stdout, stderr) => {
                 const combined = (stdout + '\n' + stderr).trim();
+                
                 if (error) {
                     if (!combined.includes('No such file or directory') && !combined.includes('does not exist')) {
                         Logger.logError(`[executeAdbCommand] Error: ${error.message}\nOutput: ${combined}`);
@@ -429,10 +453,14 @@ export class ConnectionManager {
                     reject(new Error(combined || error.message));
                     return;
                 }
-                // Suppress output logging for pull/push since it's noisy and binary sometimes
-                if (!args.startsWith('-s ') || (!args.includes(' pull ') && !args.includes(' push '))) {
-                    Logger.logOutput(combined);
+                
+                // Suppress output logging for devices, pull and push since they're noisy or binary
+                if (args !== 'devices' && combined) {
+                    if (!args.startsWith('-s ') || (!args.includes(' pull ') && !args.includes(' push '))) {
+                        Logger.logOutput(combined);
+                    }
                 }
+                
                 resolve(combined);
             });
         });

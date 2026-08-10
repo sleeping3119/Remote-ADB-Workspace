@@ -214,6 +214,70 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     };
 
+    // Auto-connect saved connections on startup (runs in background, doesn't block activation)
+    const savedConnections = vscode.workspace.getConfiguration().get<any[]>('remote-adb.savedConnections') || [];
+    if (savedConnections.length > 0 && !(adbFolders && adbFolders.length > 0)) {
+        // Only auto-connect when NOT in a remote-adb workspace (which has its own reconnect logic)
+        (async () => {
+            // Ensure ADB daemon is running before attempting connections.
+            // Without this, adb connect and the tree view's adb devices can race to start
+            // the daemon simultaneously, causing "could not read ok from ADB Server".
+            try {
+                await connectionManager.startServer();
+            } catch (e: any) {
+                Logger.logWarning(`[Auto-Connect] Failed to start ADB server: ${e.message}`);
+                return; // Can't do anything without the daemon
+            }
+
+            for (const conn of savedConnections) {
+                let ipPort = conn.ipPort?.trim();
+                if (!ipPort) { continue; }
+                if (!ipPort.includes(':')) { ipPort += ':5555'; }
+
+                try {
+                    Logger.logOutput(`[Auto-Connect] Connecting to saved connection: ${conn.alias || ipPort}`);
+                    const result = await connectionManager.connect(ipPort);
+                    Logger.logOutput(`[Auto-Connect] ${result}`);
+
+                    if (result.includes('failed to connect to') || result.includes('actively refused it') || result.includes('cannot connect to')) {
+                        Logger.logWarning(`[Auto-Connect] Could not reach ${ipPort}: ${result}`);
+                        continue;
+                    }
+
+                    const isReady = await connectionManager.waitForDeviceReady(ipPort, 10000);
+                    if (!isReady) {
+                        Logger.logWarning(`[Auto-Connect] ${ipPort} connected but device is not ready`);
+                        continue;
+                    }
+
+                    connectionManager.setActiveDevice(ipPort);
+
+                    // Switch user if specified
+                    if (conn.user && conn.user !== 'shell') {
+                        try {
+                            const success = await switchDeviceUser(ipPort, conn.user, conn.customApp);
+                            if (success) {
+                                Logger.logOutput(`[Auto-Connect] Switched to ${conn.user} on ${ipPort}`);
+                            } else {
+                                Logger.logWarning(`[Auto-Connect] Failed to switch user to ${conn.user} on ${ipPort}`);
+                            }
+                        } catch (e: any) {
+                            Logger.logWarning(`[Auto-Connect] User switch error on ${ipPort}: ${e.message}`);
+                        }
+                    }
+
+                    Logger.logOutput(`[Auto-Connect] ${conn.alias || ipPort} is ready`);
+                } catch (e: any) {
+                    Logger.logWarning(`[Auto-Connect] Failed to connect to ${ipPort}: ${e.message}`);
+                }
+            }
+
+            // Refresh the device tree after all auto-connections are attempted
+            deviceTreeProvider.refresh();
+            updateStatusBar();
+        })();
+    }
+
     // Command: Switch Device
     let switchDeviceDisposable = vscode.commands.registerCommand('remote-adb.switchDevice', async () => {
         const devices = await connectionManager.getDevices();
@@ -372,9 +436,10 @@ export async function activate(context: vscode.ExtensionContext) {
             if (item.device.id.includes(':')) {
                 try { await connectionManager.connect(item.device.id); } catch(e) {}
             }
-            const devices = await connectionManager.getDevices();
-            const reconnected = devices.find(d => d.id === item.device.id);
-            if (!reconnected || reconnected.status !== 'device') {
+            
+            // Wait for device to become 'device' status
+            const isReady = await connectionManager.waitForDeviceReady(item.device.id, 10000);
+            if (!isReady) {
                 vscode.window.showErrorMessage(`Device ${item.device.id} is not responding or disconnected. Please reconnect the device or restart ADB on the phone.`);
             } else {
                 vscode.window.showInformationMessage(`Device ${item.device.id} reconnected successfully.`);
@@ -446,66 +511,86 @@ export async function activate(context: vscode.ExtensionContext) {
         });
     }
 
+    async function switchDeviceUser(deviceId: string, targetUser: string, customApp?: string): Promise<boolean> {
+        try {
+            const shell = await connectionManager.getPersistentShell(deviceId);
+            
+            if (targetUser === 'shell') {
+                let user = await shell.getCurrentUser();
+                if (user.name === 'shell') {
+                    return true;
+                }
+                await shell.sendRawCommand('exit');
+                shell.refreshCurrentUser();
+                shell.activeSwitchCommand = { type: 'shell' };
+                vscode.commands.executeCommand('remote-adb.refreshDevices');
+                return true;
+            } else if (targetUser === 'root') {
+                let user = await shell.getCurrentUser();
+                if (user.name !== 'shell') {
+                    await shell.sendRawCommand('exit');
+                    shell.refreshCurrentUser();
+                }
+                await shell.sendRawCommand('su');
+                shell.refreshCurrentUser();
+                user = await shell.getCurrentUser();
+                if (user.name !== 'root') {
+                    await shell.sendRawCommand('exit');
+                    vscode.window.showErrorMessage('Device is unrooted. Failed to switch to root.');
+                    return false;
+                } else {
+                    shell.activeSwitchCommand = { type: 'root' };
+                    vscode.commands.executeCommand('remote-adb.refreshDevices');
+                    return true;
+                }
+            } else if (targetUser === 'termux') {
+                await setupAppEnvironment(deviceId, 'com.termux', shell, './files/home/.raw');
+                return true;
+            } else if (targetUser === 'custom' && customApp) {
+                await setupAppEnvironment(deviceId, customApp, shell);
+                return true;
+            }
+            return false;
+        } catch (error: any) {
+            if (error.message && error.message.includes('ADB shell closed')) {
+                vscode.window.showErrorMessage(`Switch to ${targetUser} failed: Device might be unrooted or app not installed.`);
+            } else {
+                vscode.window.showErrorMessage(`Failed to switch to ${targetUser}: ${error.message}`);
+            }
+            return false;
+        }
+    }
+
     context.subscriptions.push(vscode.commands.registerCommand('remote-adb.switchUserRoot', async (deviceItem: DeviceTreeItem) => {
         if (!deviceItem) return;
-        const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
-        
-        let user = await shell.getCurrentUser();
-        if (user.name !== 'shell') {
-            await shell.sendRawCommand('exit');
-            shell.refreshCurrentUser();
-        }
-
-        try {
-            await shell.sendRawCommand('su');
-            shell.refreshCurrentUser();
-            user = await shell.getCurrentUser();
-            if (user.name !== 'root') {
-                await shell.sendRawCommand('exit');
-                vscode.window.showErrorMessage('Device is unrooted. Failed to switch to root.');
-            } else {
-                shell.activeSwitchCommand = { type: 'root' };
-                vscode.window.showInformationMessage('Switched to root');
-                vscode.commands.executeCommand('remote-adb.refreshDevices');
-            }
-        } catch (error: any) {
-            // Unrooted devices often kill the shell or exit immediately when 'su' is executed
-            if (error.message && error.message.includes('ADB shell closed')) {
-                vscode.window.showErrorMessage('Device is unrooted.');
-            } else {
-                vscode.window.showErrorMessage(`Failed to switch to root: ${error.message}`);
-            }
+        const success = await switchDeviceUser(deviceItem.device.id, 'root');
+        if (success) {
+            vscode.window.showInformationMessage('Switched to root');
         }
     }));
 
     context.subscriptions.push(vscode.commands.registerCommand('remote-adb.switchUserTermux', async (deviceItem: DeviceTreeItem) => {
         if (!deviceItem) return;
-        const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
-        await setupAppEnvironment(deviceItem.device.id, 'com.termux', shell, './files/home/.raw');
+        await switchDeviceUser(deviceItem.device.id, 'termux');
     }));
 
     context.subscriptions.push(vscode.commands.registerCommand('remote-adb.switchUserCustom', async (deviceItem: DeviceTreeItem) => {
         if (!deviceItem) return;
         const pkgName = await vscode.window.showInputBox({ prompt: 'Enter package name of debuggable app' });
         if (!pkgName) return;
-        const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
-        await setupAppEnvironment(deviceItem.device.id, pkgName, shell);
+        await switchDeviceUser(deviceItem.device.id, 'custom', pkgName);
     }));
 
     context.subscriptions.push(vscode.commands.registerCommand('remote-adb.switchUserShell', async (deviceItem: DeviceTreeItem) => {
         if (!deviceItem) return;
         const shell = await connectionManager.getPersistentShell(deviceItem.device.id);
-        let user = await shell.getCurrentUser();
+        const user = await shell.getCurrentUser();
         if (user.name === 'shell') {
             vscode.window.showInformationMessage('Already in shell environment');
             return;
         }
-        await shell.sendRawCommand('exit');
-        shell.refreshCurrentUser();
-        user = await shell.getCurrentUser();
-        shell.activeSwitchCommand = { type: 'shell' };
-        vscode.window.showInformationMessage('Switched to shell');
-        vscode.commands.executeCommand('remote-adb.refreshDevices');
+        await switchDeviceUser(deviceItem.device.id, 'shell');
+        vscode.window.showInformationMessage('Switched back to shell environment');
     }));
 
     let openInCurrentWindowDisposable = vscode.commands.registerCommand('remote-adb.openInCurrentWindow', async (deviceItem: DeviceTreeItem) => {
@@ -599,15 +684,56 @@ export async function activate(context: vscode.ExtensionContext) {
 
     let connectTcpipDisposable = vscode.commands.registerCommand('remote-adb.connectTcpip', async () => {
 
-        const ipPort = await vscode.window.showInputBox({ 
-            prompt: 'Enter Device IP and Port (e.g. 192.168.100.238:33935)',
-            placeHolder: '192.168.100.238:33935',
-            validateInput: (value) => {
-                if (!value) {return 'IP and Port cannot be empty';}
-                if (!value.includes(':')) {return 'Please enter IP and Port separated by a colon';}
-                return null;
+        const savedConnections = vscode.workspace.getConfiguration().get<any[]>('remote-adb.savedConnections') || [];
+        
+        let ipPort: string | undefined;
+        let targetUser: string | undefined;
+        let customApp: string | undefined;
+
+        if (savedConnections.length === 1) {
+            ipPort = savedConnections[0].ipPort;
+            targetUser = savedConnections[0].user;
+            customApp = savedConnections[0].customApp;
+        } else if (savedConnections.length > 1) {
+            const items = savedConnections.map((conn: any) => ({
+                label: conn.alias ? `$(device) ${conn.alias}` : `$(device) ${conn.ipPort}`,
+                description: conn.user === 'custom' ? `(as ${conn.customApp})` : `(as ${conn.user})`,
+                config: conn
+            }));
+            items.push({ label: '$(add) Enter Manually...', description: '', config: null });
+
+            const selected = await vscode.window.showQuickPick(items, {
+                placeHolder: 'Select a saved connection or enter manually'
+            });
+
+            if (!selected) { return; }
+
+            if (selected.config) {
+                ipPort = selected.config.ipPort;
+                targetUser = selected.config.user;
+                customApp = selected.config.customApp;
             }
-        });
+        }
+
+        if (ipPort) {
+            ipPort = ipPort.trim();
+            if (!ipPort.includes(':')) {
+                ipPort += ':5555';
+            }
+        }
+
+        if (!ipPort) {
+            ipPort = await vscode.window.showInputBox({ 
+                prompt: 'Enter Device IP and Port (e.g. 192.168.100.238:33935)',
+                placeHolder: '192.168.100.238:33935',
+                validateInput: (value) => {
+                    if (!value) {return 'IP and Port cannot be empty';}
+                    if (!value.includes(':')) {return 'Please enter IP and Port separated by a colon';}
+                    return null;
+                }
+            });
+        }
+        
         if (!ipPort) {return;}
 
         vscode.window.withProgress({
@@ -626,23 +752,37 @@ export async function activate(context: vscode.ExtensionContext) {
             };
 
             try {
-                const result = await connectionManager.connect(ipPort);
-                if (result.includes('failed to connect to')) {handleNotPaired(ipPort);}
-                else if (result.includes('failed to authenticate to')) {handleAuthFailure(ipPort);}
+                const result = await connectionManager.connect(ipPort!);
+                if (result.includes('failed to connect to')) {handleNotPaired(ipPort!);}
+                else if (result.includes('failed to authenticate to')) {handleAuthFailure(ipPort!);}
                 else if (result.includes('actively refused it') || result.includes('cannot connect to')) {
                     vscode.window.showErrorMessage(`ADB Connect failed: Connection refused.`);
                 } else {
-                    connectionManager.setActiveDevice(ipPort);
+                    const isReady = await connectionManager.waitForDeviceReady(ipPort!, 10000);
+                    if (!isReady) {
+                        vscode.window.showWarningMessage(`Connected to ${ipPort!} but device is offline or unreachable.`);
+                    }
+
+                    connectionManager.setActiveDevice(ipPort!);
                     updateStatusBar();
+                    
+                    if (targetUser && isReady) {
+                        const success = await switchDeviceUser(ipPort!, targetUser, customApp);
+                        if (!success) {
+                            vscode.window.showErrorMessage(`Connected, but failed to switch user to ${targetUser}`);
+                        }
+                    }
+
                     const openAction = 'Open Folder';
                     vscode.window.showInformationMessage(`ADB Connect: ${result}`, openAction).then(sel => {
                         if (sel === openAction) {vscode.commands.executeCommand('remote-adb.openFolder');}
                     });
                 }
             } catch (error: any) {
+
                 const msg = error.message || '';
-                if (msg.includes('failed to connect to')) {handleNotPaired(ipPort);}
-                else if (msg.includes('failed to authenticate to')) {handleAuthFailure(ipPort);}
+                if (msg.includes('failed to connect to')) {handleNotPaired(ipPort!);}
+                else if (msg.includes('failed to authenticate to')) {handleAuthFailure(ipPort!);}
                 else if (msg.includes('actively refused it') || msg.includes('cannot connect to')) {vscode.window.showErrorMessage(`ADB Connect failed: Connection refused.`);}
                 else {vscode.window.showErrorMessage(`Connection failed: ${msg}`);}
             }

@@ -178,6 +178,21 @@
           "type": "string",
           "default": "",
           "description": "Path to the custom ADB executable (leave blank to use automatically downloaded platform-tools)"
+        },
+        "remote-adb.savedConnections": {
+          "type": "array",
+          "default": [],
+          "markdownDescription": "Saved ADB connections. Allows for quick connection via TCP/IP directly to a specific user context.\n\nExample configuration:\n```json\n[\n  {\n    \"alias\": \"My Debug App\",\n    \"ipPort\": \"192.168.1.100:5555\",\n    \"user\": \"custom\",\n    \"customApp\": \"com.example.app\"\n  }\n]\n```",
+          "items": {
+            "type": "object",
+            "properties": {
+              "alias": { "type": "string", "description": "A friendly name to show in the Quick Picker." },
+              "ipPort": { "type": "string", "description": "The device IP and port (e.g. 192.168.1.100:5555)." },
+              "user": { "type": "string", "enum": ["root", "shell", "termux", "custom"], "description": "The target execution user context." },
+              "customApp": { "type": "string", "description": "Package name (required if user is 'custom')." }
+            },
+            "required": ["ipPort", "user"]
+          }
         }
       }
     },
