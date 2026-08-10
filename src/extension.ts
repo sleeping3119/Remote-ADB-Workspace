@@ -544,12 +544,15 @@ export async function activate(context: vscode.ExtensionContext) {
                     return true;
                 }
             } else if (targetUser === 'termux') {
-                await setupAppEnvironment(deviceId, 'com.termux', shell, './files/home/.raw');
-                return true;
-            } else if (targetUser === 'custom' && customApp) {
-                await setupAppEnvironment(deviceId, customApp, shell);
-                return true;
+                return await setupAppEnvironment(deviceId, 'com.termux', shell, './files/home/.raw');
+            } else if (targetUser === 'custom') {
+                if (!customApp || !customApp.trim()) {
+                    vscode.window.showErrorMessage(`Failed to switch user: User is set to 'custom', but no package name ('customApp') was provided in configuration.`);
+                    return false;
+                }
+                return await setupAppEnvironment(deviceId, customApp.trim(), shell);
             }
+            vscode.window.showErrorMessage(`Failed to switch user: Unknown target user '${targetUser}'.`);
             return false;
         } catch (error: any) {
             if (error.message && error.message.includes('ADB shell closed')) {
