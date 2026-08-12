@@ -5,6 +5,7 @@ import * as https from 'https';
 import * as vscode from 'vscode';
 
 import { PlatformToolsManager } from './platformToolsManager';
+import { ConnectionManager } from './connectionManager';
 import { Logger } from '../logger';
 
 const RAW_DIR = '/data/local/tmp/.raw';
@@ -16,10 +17,12 @@ export class ToyboxManager {
     private cachedPrefixes: Map<string, string> = new Map();
     private pendingPrefixes: Map<string, Promise<string>> = new Map();
     private rawFolderPaths: Map<string, string> = new Map();
+    private connectionManager: ConnectionManager;
 
-    constructor(toolsManager: PlatformToolsManager, context: vscode.ExtensionContext) {
+    constructor(toolsManager: PlatformToolsManager, context: vscode.ExtensionContext, connectionManager: ConnectionManager) {
         this.toolsManager = toolsManager;
         this.context = context;
+        this.connectionManager = connectionManager;
     }
 
     public async getToyboxPrefix(deviceId: string, username: string = 'shell'): Promise<string> {
@@ -138,7 +141,8 @@ export class ToyboxManager {
 
     private async execAdb(deviceId: string, args: string): Promise<string> {
         const adbPath = await this.toolsManager.getAdbPath();
-        const cmd = `"${adbPath}" -s ${deviceId} ${args}`;
+        const realId = await this.connectionManager.resolveDeviceId(deviceId);
+        const cmd = `"${adbPath}" -s ${realId} ${args}`;
         Logger.logCommand(cmd);
         return new Promise((resolve, reject) => {
             cp.exec(cmd, (error, stdout, stderr) => {

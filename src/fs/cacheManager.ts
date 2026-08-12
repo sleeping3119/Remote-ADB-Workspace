@@ -150,7 +150,8 @@ exit "$tar_status"
             }
         }
 
-        const fullAdbCommand = `"${adbPath}" -s ${deviceId} exec-out '${execOutCmd}'`;
+        const realDeviceId = await this.connectionManager.resolveDeviceId(deviceId);
+        const fullAdbCommand = `"${adbPath}" -s ${realDeviceId} exec-out '${execOutCmd}'`;
         Logger.logCommand(`[CacheManager] Executing background cache shell command: ${execOutCmd}`);
         Logger.logCommand(`[CacheManager] Full subprocess command: ${fullAdbCommand}`);
         
@@ -160,7 +161,7 @@ exit "$tar_status"
             cancellable: true
         }, (progress, token) => {
             return new Promise<void>((resolve, reject) => {
-                const adbProc = spawn(adbPath, ['-s', deviceId, 'exec-out', execOutCmd], {
+                const adbProc = spawn(adbPath, ['-s', realDeviceId, 'exec-out', execOutCmd], {
                     stdio: ['ignore', 'pipe', 'pipe']
                 });
                 

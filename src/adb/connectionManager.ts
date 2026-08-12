@@ -19,6 +19,8 @@ export class PersistentAdbShell {
     private commandQueue: { command: string, resolve: (data: string) => void, reject: (err: Error) => void, isRaw?: boolean }[] = [];
     private isBusy = false;
     public isDead = false;
+    public isIntendedClose = false;
+    public onUnexpectedClose?: () => void;
     private currentUser: { name: string, groups: string[] } | null = null;
     private pendingUserPromise: Promise<{ name: string, groups: string[] }> | null = null;
 
@@ -78,6 +80,9 @@ export class PersistentAdbShell {
                 this.commandQueue.shift()?.reject(new Error('ADB shell closed'));
             }
             this.isBusy = false;
+            if (!this.isIntendedClose && this.onUnexpectedClose) {
+                this.onUnexpectedClose();
+            }
         });
 
         this.process.on('error', () => {
@@ -192,6 +197,7 @@ export class PersistentAdbShell {
     
     public close() {
         if (!this.isDead) {
+            this.isIntendedClose = true;
             this.process.kill();
         }
     }
@@ -205,23 +211,26 @@ export class ConnectionManager {
     private deviceIdMap: Map<string, string> = new Map();
     private shellReadyPromise: Promise<void> | null = null;
     private pendingGetDevices: Promise<AdbDevice[]> | null = null;
+    
+    private adbToAndroidIdMap: Map<string, string> = new Map();
+    private androidToAdbIdMap: Map<string, string> = new Map();
+    private _onDeviceDisconnected = new vscode.EventEmitter<string>();
+    public readonly onDeviceDisconnected = this._onDeviceDisconnected.event;
 
     constructor(context: vscode.ExtensionContext, toolsManager: PlatformToolsManager) {
         this.context = context;
         this.toolsManager = toolsManager;
     }
 
+    private knownTcpDevices: Set<string> = new Set();
+
     private getKnownTcpDevices(): string[] {
-        return this.context.globalState.get<string[]>('knownTcpDevices', []);
+        return Array.from(this.knownTcpDevices);
     }
 
     private addKnownTcpDevice(deviceId: string) {
         if (deviceId.includes(':')) {
-            const known = this.getKnownTcpDevices();
-            if (!known.includes(deviceId)) {
-                known.push(deviceId);
-                this.context.globalState.update('knownTcpDevices', known);
-            }
+            this.knownTcpDevices.add(deviceId);
         }
     }
 
@@ -244,14 +253,50 @@ export class ConnectionManager {
         }
     }
 
+    public async resolveAndroidIdForDevice(adbDeviceId: string): Promise<string | undefined> {
+        if (this.adbToAndroidIdMap.has(adbDeviceId)) {
+            return this.adbToAndroidIdMap.get(adbDeviceId);
+        }
+        try {
+            const output = await this.executeAdbCommand(`-s ${adbDeviceId} shell settings get secure android_id`);
+            const id = output.trim();
+            if (id && id !== 'null') {
+                this.adbToAndroidIdMap.set(adbDeviceId, id);
+                this.androidToAdbIdMap.set(id, adbDeviceId);
+                return id;
+            }
+        } catch(e) {
+            Logger.logWarning(`[ConnectionManager] Failed to get android_id for ${adbDeviceId}: ${e}`);
+        }
+        return undefined;
+    }
+
     public async resolveDeviceId(idFromUri: string): Promise<string> {
         const lower = idFromUri.toLowerCase();
+        
+        // Backward compatibility: if it matches a known ADB ID directly
         if (this.deviceIdMap.has(lower)) {
             return this.deviceIdMap.get(lower)!;
         }
         
-        // Map is empty or device not found, try fetching current devices to populate the map
-        await this.getDevices();
+        // If we already resolved this Android ID
+        if (this.androidToAdbIdMap.has(idFromUri)) {
+            return this.androidToAdbIdMap.get(idFromUri)!;
+        }
+        
+        // Fetch current devices
+        const devices = await this.getDevices();
+        const connectedDevices = devices.filter(d => d.status === 'device');
+        
+        // Resolve Android IDs for all currently connected devices
+        for (const dev of connectedDevices) {
+            await this.resolveAndroidIdForDevice(dev.id);
+        }
+        
+        // Check again after resolving
+        if (this.androidToAdbIdMap.has(idFromUri)) {
+            return this.androidToAdbIdMap.get(idFromUri)!;
+        }
         
         return this.deviceIdMap.get(lower) || idFromUri;
     }
@@ -276,30 +321,37 @@ export class ConnectionManager {
         }
 
         const shellPromise = (async () => {
-            const adbPath = await this.toolsManager.getAdbPath();
-            const shell = new PersistentAdbShell(adbPath, realId);
-            
-            // Ensure shell is ready by waiting for a basic command to echo back
-            await shell.executeCommand('echo "ADB_INIT_OK"');
-            
-            if (previousSwitchCommand) {
-                if (previousSwitchCommand.type === 'root') {
-                    await shell.sendRawCommand('su');
-                } else if (previousSwitchCommand.type === 'termux') {
-                    await shell.sendRawCommand('run-as com.termux');
-                } else if (previousSwitchCommand.type === 'custom' && previousSwitchCommand.pkgName) {
-                    await shell.sendRawCommand(`run-as ${previousSwitchCommand.pkgName}`);
-                }
-                shell.activeSwitchCommand = previousSwitchCommand;
+            try {
+                const adbPath = await this.toolsManager.getAdbPath();
+                const shell = new PersistentAdbShell(adbPath, realId);
                 
-                // Ensure environment switch has settled before querying user
-                await new Promise(res => setTimeout(res, 200));
-                shell.refreshCurrentUser();
+                shell.onUnexpectedClose = () => {
+                    this._onDeviceDisconnected.fire(realId);
+                };
+                
+                // Ensure shell is ready by waiting for a basic command to echo back
+                await shell.executeCommand('echo "ADB_INIT_OK"');
+                
+                if (previousSwitchCommand) {
+                    if (previousSwitchCommand.type === 'root') {
+                        await shell.sendRawCommand('su');
+                    } else if (previousSwitchCommand.type === 'termux') {
+                        await shell.sendRawCommand('run-as com.termux');
+                    } else if (previousSwitchCommand.type === 'custom' && previousSwitchCommand.pkgName) {
+                        await shell.sendRawCommand(`run-as ${previousSwitchCommand.pkgName}`);
+                    }
+                    shell.activeSwitchCommand = previousSwitchCommand;
+                    
+                    // Ensure environment switch has settled before querying user
+                    await new Promise(res => setTimeout(res, 200));
+                    shell.refreshCurrentUser();
+                }
+                
+                this.shells.set(realId, shell);
+                return shell;
+            } finally {
+                this.pendingShells.delete(realId);
             }
-            
-            this.shells.set(realId, shell);
-            this.pendingShells.delete(realId);
-            return shell;
         })();
 
         this.pendingShells.set(realId, shellPromise);

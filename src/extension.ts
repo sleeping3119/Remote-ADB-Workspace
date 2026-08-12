@@ -18,7 +18,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const toolsManager = new PlatformToolsManager(context);
     const connectionManager = new ConnectionManager(context, toolsManager);
-    const toyboxManager = new ToyboxManager(toolsManager, context);
+    const toyboxManager = new ToyboxManager(toolsManager, context, connectionManager);
     const cacheManager = new CacheManager(context, connectionManager, toyboxManager);
 
     const fsProvider = new AdbFileSystemProvider(connectionManager, toyboxManager, cacheManager);
@@ -33,6 +33,80 @@ export async function activate(context: vscode.ExtensionContext) {
         deviceTreeProvider.refresh();
     });
     context.subscriptions.push(refreshDevicesDisposable);
+
+    // Status Bar Item for device
+    const deviceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    deviceStatusBar.command = 'remote-adb.switchDevice';
+    context.subscriptions.push(deviceStatusBar);
+
+    function updateStatusBar() {
+        const active = connectionManager.getActiveDevice();
+        if (active) {
+            deviceStatusBar.text = `$(device-mobile) ADB: ${active}`;
+            deviceStatusBar.show();
+        } else {
+            deviceStatusBar.hide();
+        }
+    }
+
+    // Run auto-connect in the background immediately
+    const autoConnectPromise = (async () => {
+        const savedConnections = vscode.workspace.getConfiguration().get<any[]>('remote-adb.savedConnections') || [];
+        if (savedConnections.length === 0) return;
+
+        try {
+            await connectionManager.startServer();
+        } catch (e: any) {
+            Logger.logWarning(`[Auto-Connect] Failed to start ADB server: ${e.message}`);
+            return;
+        }
+
+        for (const conn of savedConnections) {
+            let ipPort = conn.ipPort?.trim();
+            if (!ipPort) { continue; }
+            if (!ipPort.includes(':')) { ipPort += ':5555'; }
+
+            try {
+                Logger.logOutput(`[Auto-Connect] Connecting to saved connection: ${conn.alias || ipPort}`);
+                const result = await connectionManager.connect(ipPort);
+                Logger.logOutput(`[Auto-Connect] ${result}`);
+
+                if (result.includes('failed to connect to') || result.includes('actively refused it') || result.includes('cannot connect to')) {
+                    Logger.logWarning(`[Auto-Connect] Could not reach ${ipPort}: ${result}`);
+                    continue;
+                }
+
+                const isReady = await connectionManager.waitForDeviceReady(ipPort, 10000);
+                if (!isReady) {
+                    Logger.logWarning(`[Auto-Connect] ${ipPort} connected but device is not ready`);
+                    continue;
+                }
+
+                connectionManager.setActiveDevice(ipPort);
+
+                // Switch user if specified
+                if (conn.user && conn.user !== 'shell') {
+                    try {
+                        const success = await switchDeviceUser(ipPort, conn.user, conn.customApp);
+                        if (success) {
+                            Logger.logOutput(`[Auto-Connect] Switched to ${conn.user} on ${ipPort}`);
+                        } else {
+                            Logger.logWarning(`[Auto-Connect] Failed to switch user to ${conn.user} on ${ipPort}`);
+                        }
+                    } catch (e: any) {
+                        Logger.logWarning(`[Auto-Connect] User switch error on ${ipPort}: ${e.message}`);
+                    }
+                }
+
+                Logger.logOutput(`[Auto-Connect] ${conn.alias || ipPort} is ready`);
+            } catch (e: any) {
+                Logger.logWarning(`[Auto-Connect] Failed to connect to ${ipPort}: ${e.message}`);
+            }
+        }
+
+        deviceTreeProvider.refresh();
+        updateStatusBar();
+    })();
 
     // If we are opening a remote-adb workspace, retrieve the manifest and log it
     const adbFolders = vscode.workspace.workspaceFolders?.filter(f => f.uri.scheme === 'remote-adb');
@@ -96,17 +170,14 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         
         if (slimManifest) {
-            // Check if device is connected, if not and it's TCP, try to reconnect
-            const devices = await connectionManager.getDevices();
-            const isConnected = devices.find(d => d.id === deviceId && d.status === 'device');
-            if (!isConnected && deviceId.includes(':')) {
-                Logger.logOutput(`[Extension Activate] Device ${deviceId} not found, attempting auto-reconnect...`);
-                try {
-                    await connectionManager.connect(deviceId);
-                    // Wait a moment for adb to fully register the connection
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                } catch (e: any) {
-                    Logger.logError(`[Extension Activate] Auto-reconnect failed: ${e.message}`);
+            // Try to resolve the androidId. If it's not found, wait for autoConnectPromise to see if it connects.
+            let adbId = await connectionManager.resolveDeviceId(deviceId);
+            if (adbId === deviceId) {
+                Logger.logOutput(`[Extension Activate] Device with Android ID ${deviceId} not found, waiting for auto-connects to finish...`);
+                await autoConnectPromise;
+                adbId = await connectionManager.resolveDeviceId(deviceId);
+                if (adbId === deviceId) {
+                    vscode.window.showErrorMessage(`ADB Workspace failed to load: Device with Android ID ${deviceId} is not connected.`);
                 }
             }
 
@@ -141,7 +212,8 @@ export async function activate(context: vscode.ExtensionContext) {
             const createProfile = async () => {
                 const adbPath = await toolsManager.getAdbPath();
                 const root = slimManifest.workspaceRoot;
-                let shellArgs = ['-s', deviceId, 'shell', '-t'];
+                const realId = await connectionManager.resolveDeviceId(deviceId);
+                let shellArgs = ['-s', realId, 'shell', '-t'];
                 const switchCmd = slimManifest.switchCommand;
                 
                 if (switchCmd && switchCmd.type !== 'shell') {
@@ -198,86 +270,6 @@ export async function activate(context: vscode.ExtensionContext) {
             resolveInit();
         }
     }
-
-    // Status Bar Item for device
-    const deviceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-    deviceStatusBar.command = 'remote-adb.switchDevice';
-    context.subscriptions.push(deviceStatusBar);
-
-    const updateStatusBar = () => {
-        const active = connectionManager.getActiveDevice();
-        if (active) {
-            deviceStatusBar.text = `$(device-mobile) ADB: ${active}`;
-            deviceStatusBar.show();
-        } else {
-            deviceStatusBar.hide();
-        }
-    };
-
-    // Auto-connect saved connections on startup (runs in background, doesn't block activation)
-    const savedConnections = vscode.workspace.getConfiguration().get<any[]>('remote-adb.savedConnections') || [];
-    if (savedConnections.length > 0 && !(adbFolders && adbFolders.length > 0)) {
-        // Only auto-connect when NOT in a remote-adb workspace (which has its own reconnect logic)
-        (async () => {
-            // Ensure ADB daemon is running before attempting connections.
-            // Without this, adb connect and the tree view's adb devices can race to start
-            // the daemon simultaneously, causing "could not read ok from ADB Server".
-            try {
-                await connectionManager.startServer();
-            } catch (e: any) {
-                Logger.logWarning(`[Auto-Connect] Failed to start ADB server: ${e.message}`);
-                return; // Can't do anything without the daemon
-            }
-
-            for (const conn of savedConnections) {
-                let ipPort = conn.ipPort?.trim();
-                if (!ipPort) { continue; }
-                if (!ipPort.includes(':')) { ipPort += ':5555'; }
-
-                try {
-                    Logger.logOutput(`[Auto-Connect] Connecting to saved connection: ${conn.alias || ipPort}`);
-                    const result = await connectionManager.connect(ipPort);
-                    Logger.logOutput(`[Auto-Connect] ${result}`);
-
-                    if (result.includes('failed to connect to') || result.includes('actively refused it') || result.includes('cannot connect to')) {
-                        Logger.logWarning(`[Auto-Connect] Could not reach ${ipPort}: ${result}`);
-                        continue;
-                    }
-
-                    const isReady = await connectionManager.waitForDeviceReady(ipPort, 10000);
-                    if (!isReady) {
-                        Logger.logWarning(`[Auto-Connect] ${ipPort} connected but device is not ready`);
-                        continue;
-                    }
-
-                    connectionManager.setActiveDevice(ipPort);
-
-                    // Switch user if specified
-                    if (conn.user && conn.user !== 'shell') {
-                        try {
-                            const success = await switchDeviceUser(ipPort, conn.user, conn.customApp);
-                            if (success) {
-                                Logger.logOutput(`[Auto-Connect] Switched to ${conn.user} on ${ipPort}`);
-                            } else {
-                                Logger.logWarning(`[Auto-Connect] Failed to switch user to ${conn.user} on ${ipPort}`);
-                            }
-                        } catch (e: any) {
-                            Logger.logWarning(`[Auto-Connect] User switch error on ${ipPort}: ${e.message}`);
-                        }
-                    }
-
-                    Logger.logOutput(`[Auto-Connect] ${conn.alias || ipPort} is ready`);
-                } catch (e: any) {
-                    Logger.logWarning(`[Auto-Connect] Failed to connect to ${ipPort}: ${e.message}`);
-                }
-            }
-
-            // Refresh the device tree after all auto-connections are attempted
-            deviceTreeProvider.refresh();
-            updateStatusBar();
-        })();
-    }
-
     // Command: Switch Device
     let switchDeviceDisposable = vscode.commands.registerCommand('remote-adb.switchDevice', async () => {
         const devices = await connectionManager.getDevices();
@@ -302,6 +294,18 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    connectionManager.onDeviceDisconnected(async (deviceId) => {
+        vscode.commands.executeCommand('remote-adb.refreshDevices');
+        const selection = await vscode.window.showErrorMessage(
+            `ADB connection to ${deviceId} closed unexpectedly. The device might have been disconnected.`,
+            'Reconnect',
+            'Dismiss'
+        );
+        if (selection === 'Reconnect') {
+            vscode.commands.executeCommand('remote-adb.handleOfflineDevice', { device: { id: deviceId } });
+        }
+    });
+
     context.subscriptions.push(vscode.commands.registerCommand('remote-adb.acceptFolderPicker', () => {
         if (triggerAcceptFolderPicker) {
             triggerAcceptFolderPicker();
@@ -316,19 +320,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Command: Open Folder
     let openFolderDisposable = vscode.commands.registerCommand('remote-adb.openFolder', async (deviceItem?: DeviceTreeItem) => {
-        let active = deviceItem ? deviceItem.device.id : connectionManager.getActiveDevice();
-        if (!active) {
-            const devices = await connectionManager.getDevices();
-            const connected = devices.filter(d => d.status === 'device');
-            if (connected.length > 0) {
-                active = connected[0].id;
-                connectionManager.setActiveDevice(active);
-                updateStatusBar();
-            } else {
-                vscode.window.showErrorMessage('No connected device. Connect a device first.');
-                return;
+        try {
+            let active = deviceItem ? deviceItem.device.id : connectionManager.getActiveDevice();
+            if (!active) {
+                const devices = await connectionManager.getDevices();
+                const connected = devices.filter(d => d.status === 'device');
+                if (connected.length > 0) {
+                    active = connected[0].id;
+                    connectionManager.setActiveDevice(active);
+                    updateStatusBar();
+                } else {
+                    vscode.window.showErrorMessage('No connected device. Connect a device first.');
+                    return;
+                }
             }
-        }
         
         const shell = await connectionManager.getPersistentShell(active);
         const pwd = await shell.executeCommand('pwd');
@@ -349,7 +354,8 @@ export async function activate(context: vscode.ExtensionContext) {
             }
             
             // Persist the manifest to global storage for workspace reload scenarios
-            const tempKey = `adbValidationManifest_${sanitizeKey(active)}_${sanitizeKey(folderPath)}.json`;
+            const androidId = await connectionManager.resolveAndroidIdForDevice(active) || active;
+            const tempKey = `adbValidationManifest_${sanitizeKey(androidId)}_${sanitizeKey(folderPath)}.json`;
             const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
             
             try {
@@ -373,26 +379,34 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.workspace.updateWorkspaceFolders(
                 vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders.length : 0,
                 0,
-                { uri: vscode.Uri.parse(`remote-adb://${active}${folderPath}`), name: `ADB: ${active}${folderPath}` }
+                { uri: vscode.Uri.parse(`remote-adb://${androidId}${folderPath}`), name: `ADB: ${active}${folderPath}` }
             );
+        }
+        } catch (error: any) {
+            if (error.message && (error.message.includes('ADB shell closed') || error.message.includes('ADB shell is dead'))) {
+                vscode.window.showErrorMessage(`Action failed: You are no longer connected to the device.`);
+            } else {
+                vscode.window.showErrorMessage(`Failed to open folder: ${error.message}`);
+            }
         }
     });
 
     // Command: Open File
     let openFileDisposable = vscode.commands.registerCommand('remote-adb.openFile', async (deviceItem?: DeviceTreeItem) => {
-        let active = deviceItem ? deviceItem.device.id : connectionManager.getActiveDevice();
-        if (!active) {
-            const devices = await connectionManager.getDevices();
-            const connected = devices.filter(d => d.status === 'device');
-            if (connected.length > 0) {
-                active = connected[0].id;
-                connectionManager.setActiveDevice(active);
-                updateStatusBar();
-            } else {
-                vscode.window.showErrorMessage('No connected device. Connect a device first.');
-                return;
+        try {
+            let active = deviceItem ? deviceItem.device.id : connectionManager.getActiveDevice();
+            if (!active) {
+                const devices = await connectionManager.getDevices();
+                const connected = devices.filter(d => d.status === 'device');
+                if (connected.length > 0) {
+                    active = connected[0].id;
+                    connectionManager.setActiveDevice(active);
+                    updateStatusBar();
+                } else {
+                    vscode.window.showErrorMessage('No connected device. Connect a device first.');
+                    return;
+                }
             }
-        }
         
         const shell = await connectionManager.getPersistentShell(active);
         const pwd = await shell.executeCommand('pwd');
@@ -410,8 +424,16 @@ export async function activate(context: vscode.ExtensionContext) {
                 return;
             }
             
-            const uri = vscode.Uri.parse(`remote-adb://${active}${filePath}`);
+            const androidId = await connectionManager.resolveAndroidIdForDevice(active) || active;
+            const uri = vscode.Uri.parse(`remote-adb://${androidId}${filePath}`);
             vscode.commands.executeCommand('vscode.open', uri);
+        }
+        } catch (error: any) {
+            if (error.message && (error.message.includes('ADB shell closed') || error.message.includes('ADB shell is dead'))) {
+                vscode.window.showErrorMessage(`Action failed: You are no longer connected to the device.`);
+            } else {
+                vscode.window.showErrorMessage(`Failed to open file: ${error.message}`);
+            }
         }
     });
 
@@ -555,8 +577,10 @@ export async function activate(context: vscode.ExtensionContext) {
             vscode.window.showErrorMessage(`Failed to switch user: Unknown target user '${targetUser}'.`);
             return false;
         } catch (error: any) {
-            if (error.message && error.message.includes('ADB shell closed')) {
-                vscode.window.showErrorMessage(`Switch to ${targetUser} failed: Device might be unrooted or app not installed.`);
+            if (error.message && (error.message.includes('ADB shell closed') || error.message.includes('ADB shell is dead'))) {
+                // ConnectionManager will handle the disconnect notification if it was a spontaneous drop.
+                // We won't show the confusing 'unrooted/app not installed' message.
+                return false;
             } else {
                 vscode.window.showErrorMessage(`Failed to switch to ${targetUser}: ${error.message}`);
             }
