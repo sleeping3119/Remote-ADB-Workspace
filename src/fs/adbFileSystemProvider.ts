@@ -657,9 +657,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
         const safePath = escapePath(targetPath);
-        // toybox ls -l prints detailed format. We filter for directories 'd' and symlinks 'l'
-        // Using sed to drop total lines or errors if they slip through, but grep '^[dl]' handles it mostly.
-        const output = await shell.executeCommand(`${prefix} ls -l "${safePath}" | ${prefix} grep '^[dl]'`);
+        // toybox ls -laL dereferences symlinks. We filter for directories 'd'
+        const output = await shell.executeCommand(`${prefix} ls -laL "${safePath}" 2>/dev/null | ${prefix} grep '^d'`);
         
         if (output.includes('Permission denied')) {
             throw vscode.FileSystemError.NoPermissions(uri);
@@ -739,8 +738,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
         
         const safePath = escapePath(targetPath);
-        // toybox ls -l prints detailed format. We filter for files '-', directories 'd' and symlinks 'l'
-        const output = await shell.executeCommand(`${prefix} ls -l "${safePath}" | ${prefix} grep '^[-dl]'`);
+        // toybox ls -laL dereferences symlinks. We filter for files '-', directories 'd' and broken symlinks 'l'
+        const output = await shell.executeCommand(`${prefix} ls -laL "${safePath}" 2>/dev/null | ${prefix} grep '^[-dl]'`);
         
         if (output.includes('Permission denied')) {
             throw vscode.FileSystemError.NoPermissions(uri);

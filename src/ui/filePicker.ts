@@ -144,7 +144,8 @@ export async function showFilePicker(
                 }
 
                 if (selected.isDir) {
-                    await loadDirectory(selected.fullPath + '/', true);
+                    const nextPath = selected.fullPath.endsWith('/') ? selected.fullPath : selected.fullPath + '/';
+                    await loadDirectory(nextPath, true);
                 } else {
                     quickPick.hide();
                     resolve(selected.fullPath);
