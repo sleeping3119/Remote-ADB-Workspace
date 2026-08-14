@@ -15,6 +15,8 @@ export async function activate(context: vscode.ExtensionContext) {
     const sanitizeKey = (s: string) => s.replace(/\/+$/, '').replace(/[/\\:*?"<>|]/g, '_');
     Logger.initialize(context);
     console.log('Congratulations, your extension "remote-adb" is now active!');
+    
+    let reopenWorkspaceTerminal: ((reconnectedDeviceId: string) => Promise<void>) | undefined;
 
     const toolsManager = new PlatformToolsManager(context);
     const connectionManager = new ConnectionManager(context, toolsManager);
@@ -169,17 +171,52 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         }
         
-        let restoreWorkspaceEnvironmentAndTerminal: (() => Promise<void>) | undefined;
+        if (slimManifest) {
+            // Try to resolve the androidId. If it's not found, wait for autoConnectPromise to see if it connects.
+            let adbId = await connectionManager.resolveDeviceId(deviceId);
+            if (adbId === deviceId) {
+                Logger.logOutput(`[Extension Activate] Device with Android ID ${deviceId} not found, waiting for auto-connects to finish...`);
+                await autoConnectPromise;
+                adbId = await connectionManager.resolveDeviceId(deviceId);
+                if (adbId === deviceId) {
+                    vscode.window.showErrorMessage(`ADB Workspace failed to load: Device with Android ID ${deviceId} is not connected.`);
+                }
+            }
 
+            try {
+                // Auto-restore environment if required
+                const switchCmd = slimManifest.switchCommand;
+                if (switchCmd && switchCmd.type !== 'shell') {
+                    const shell = await connectionManager.getPersistentShell(deviceId);
+                    const currentUser = await shell.getCurrentUser();
+                    
+                    if (currentUser.name === 'shell') {
+                        Logger.logOutput(`[Extension Activate] Restoring active user environment: ${switchCmd.type}`);
+                        if (switchCmd.type === 'root') {
+                            await shell.sendRawCommand('su');
+                            shell.refreshCurrentUser();
+                            shell.activeSwitchCommand = { type: 'root' };
+                        } else if (switchCmd.type === 'termux') {
+                            await setupAppEnvironment(adbId, 'com.termux', shell, './files/home/.raw');
+                        } else if (switchCmd.type === 'custom' && switchCmd.pkgName) {
+                            await setupAppEnvironment(adbId, switchCmd.pkgName, shell);
+                        }
+                    }
+                }
+            } catch (err: any) {
+                Logger.logError(`[Extension Activate] Failed to restore environment: ${err.message}`);
+            }
+        } else {
+            Logger.logOutput(`[Extension Activate] No manifest available.`);
+        }
+        
         if (slimManifest) {
             const createProfile = async () => {
                 const adbPath = await toolsManager.getAdbPath();
                 const root = slimManifest.workspaceRoot;
                 const realId = await connectionManager.resolveDeviceId(deviceId);
                 let shellArgs = ['-s', realId, 'shell', '-t'];
-                
-                const shell = connectionManager.getPersistentShellIfExists(deviceId);
-                const switchCmd = shell?.activeSwitchCommand || slimManifest.switchCommand;
+                const switchCmd = slimManifest.switchCommand;
                 
                 if (switchCmd && switchCmd.type !== 'shell') {
                     if (switchCmd.type === 'termux') {
@@ -201,52 +238,20 @@ export async function activate(context: vscode.ExtensionContext) {
                 });
             };
 
-            restoreWorkspaceEnvironmentAndTerminal = async () => {
-                let adbId = await connectionManager.resolveDeviceId(deviceId);
-                if (adbId === deviceId) {
-                    Logger.logOutput(`[Extension Activate] Device with Android ID ${deviceId} not found, waiting for auto-connects to finish...`);
-                    await autoConnectPromise;
-                    adbId = await connectionManager.resolveDeviceId(deviceId);
-                    if (adbId === deviceId) {
-                        vscode.window.showErrorMessage(`ADB Workspace failed to load: Device with Android ID ${deviceId} is not connected.`);
-                        return;
-                    }
-                }
-
-                try {
-                    const shell = await connectionManager.getPersistentShell(deviceId);
-                    const currentUser = await shell.getCurrentUser();
-                    const switchCmd = shell.activeSwitchCommand || slimManifest.switchCommand;
-
-                    if (switchCmd && switchCmd.type !== 'shell') {
-                        if (currentUser.name === 'shell') {
-                            Logger.logOutput(`[Extension Activate] Restoring active user environment: ${switchCmd.type}`);
-                            if (switchCmd.type === 'root') {
-                                await shell.sendRawCommand('su');
-                                shell.refreshCurrentUser();
-                                shell.activeSwitchCommand = { type: 'root' };
-                            } else if (switchCmd.type === 'termux') {
-                                await setupAppEnvironment(adbId, 'com.termux', shell, './files/home/.raw');
-                            } else if (switchCmd.type === 'custom' && switchCmd.pkgName) {
-                                await setupAppEnvironment(adbId, switchCmd.pkgName, shell);
-                            }
+            reopenWorkspaceTerminal = async (reconnectedDeviceId: string) => {
+                const realId = await connectionManager.resolveDeviceId(deviceId);
+                const reconnectedRealId = await connectionManager.resolveDeviceId(reconnectedDeviceId);
+                if (reconnectedRealId === realId) {
+                    const existing = vscode.window.terminals.find(t => t.name === 'ADB Shell' && t.exitStatus === undefined);
+                    if (!existing) {
+                        try {
+                            const profile = await createProfile();
+                            const terminal = vscode.window.createTerminal(profile.options as vscode.TerminalOptions);
+                            terminal.show();
+                        } catch (e) {
+                            Logger.logError(`Failed to reopen terminal: ${e}`);
                         }
                     }
-                } catch (err: any) {
-                    Logger.logError(`[Extension Activate] Failed to restore environment: ${err.message}`);
-                }
-
-                try {
-                    const profile = await createProfile();
-                    vscode.window.terminals.forEach(t => {
-                        if (t.name === 'ADB Shell' || t.name.startsWith('ADB Shell')) {
-                            t.dispose();
-                        }
-                    });
-                    const terminal = vscode.window.createTerminal(profile.options as vscode.TerminalOptions);
-                    terminal.show();
-                } catch (e) {
-                    Logger.logError(`[Extension Activate] Failed to auto-start terminal: ${e}`);
                 }
             };
 
@@ -256,14 +261,17 @@ export async function activate(context: vscode.ExtensionContext) {
                 }
             }));
 
-            // Automatically open/restore terminal when workspace loads
-            restoreWorkspaceEnvironmentAndTerminal();
+            // Automatically open the terminal when workspace starts
+            createProfile().then(profile => {
+                const terminal = vscode.window.createTerminal(profile.options as vscode.TerminalOptions);
+                terminal.show();
+            }).catch(e => {
+                Logger.logError(`[Extension Activate] Failed to auto-start terminal: ${e}`);
+            });
 
             // Listen for newly opened ADB Shell terminals to inject root commands
             context.subscriptions.push(vscode.window.onDidOpenTerminal(terminal => {
-                const shell = connectionManager.getPersistentShellIfExists(deviceId);
-                const switchCmd = shell?.activeSwitchCommand || slimManifest.switchCommand;
-                if (terminal.name === 'ADB Shell' && switchCmd?.type === 'root') {
+                if (terminal.name === 'ADB Shell' && slimManifest.switchCommand?.type === 'root') {
                     // Send the directory change command directly to the interactive root shell
                     terminal.sendText(`cd '${slimManifest.workspaceRoot}' && clear`);
                 }
@@ -273,8 +281,6 @@ export async function activate(context: vscode.ExtensionContext) {
             cacheManager.initializeCache(deviceId, slimManifest.workspaceRoot).catch(e => {
                 Logger.logError(`[Extension Activate] Cache initialization failed: ${e}`);
             });
-        } else {
-            Logger.logOutput(`[Extension Activate] No manifest available.`);
         }
         
         // Ensure the Explorer view is brought to focus
@@ -478,8 +484,8 @@ export async function activate(context: vscode.ExtensionContext) {
                 vscode.window.showErrorMessage(`Device ${item.device.id} is not responding or disconnected. Please reconnect the device or restart ADB on the phone.`);
             } else {
                 vscode.window.showInformationMessage(`Device ${item.device.id} reconnected successfully.`);
-                if (slimManifest && restoreWorkspaceEnvironmentAndTerminal) {
-                    await restoreWorkspaceEnvironmentAndTerminal();
+                if (reopenWorkspaceTerminal) {
+                    await reopenWorkspaceTerminal(item.device.id);
                 }
             }
             vscode.commands.executeCommand('remote-adb.refreshDevices');
