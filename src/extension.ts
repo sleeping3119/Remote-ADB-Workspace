@@ -195,9 +195,9 @@ export async function activate(context: vscode.ExtensionContext) {
                             shell.refreshCurrentUser();
                             shell.activeSwitchCommand = { type: 'root' };
                         } else if (switchCmd.type === 'termux') {
-                            await setupAppEnvironment(deviceId, 'com.termux', shell, './files/home/.raw');
+                            await setupAppEnvironment(adbId, 'com.termux', shell, './files/home/.raw');
                         } else if (switchCmd.type === 'custom' && switchCmd.pkgName) {
-                            await setupAppEnvironment(deviceId, switchCmd.pkgName, shell);
+                            await setupAppEnvironment(adbId, switchCmd.pkgName, shell);
                         }
                     }
                 }
@@ -566,13 +566,15 @@ export async function activate(context: vscode.ExtensionContext) {
                     return true;
                 }
             } else if (targetUser === 'termux') {
-                return await setupAppEnvironment(deviceId, 'com.termux', shell, './files/home/.raw');
+                const adbId = await connectionManager.resolveDeviceId(deviceId);
+                return await setupAppEnvironment(adbId, 'com.termux', shell, './files/home/.raw');
             } else if (targetUser === 'custom') {
                 if (!customApp || !customApp.trim()) {
                     vscode.window.showErrorMessage(`Failed to switch user: User is set to 'custom', but no package name ('customApp') was provided in configuration.`);
                     return false;
                 }
-                return await setupAppEnvironment(deviceId, customApp.trim(), shell);
+                const adbId = await connectionManager.resolveDeviceId(deviceId);
+                return await setupAppEnvironment(adbId, customApp.trim(), shell);
             }
             vscode.window.showErrorMessage(`Failed to switch user: Unknown target user '${targetUser}'.`);
             return false;

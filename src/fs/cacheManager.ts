@@ -109,9 +109,10 @@ export class CacheManager {
         await fs.promises.mkdir(cacheDir, { recursive: true });
 
         const adbPath = await this.connectionManager.toolsManager.getAdbPath();
+        const realDeviceId = await this.connectionManager.resolveDeviceId(deviceId);
         const shell = await this.connectionManager.getPersistentShell(deviceId);
         const currentUser = await shell.getCurrentUser();
-        const rawFolder = await this.toyboxManager.getRawFolderPath(deviceId, currentUser.name, shell);
+        const rawFolder = await this.toyboxManager.getRawFolderPath(realDeviceId, currentUser.name, shell);
         
         const runId = `tar_${Date.now()}`;
         const statusFile = `${rawFolder}/.${runId}_status`;
@@ -150,7 +151,6 @@ exit "$tar_status"
             }
         }
 
-        const realDeviceId = await this.connectionManager.resolveDeviceId(deviceId);
         const fullAdbCommand = `"${adbPath}" -s ${realDeviceId} exec-out '${execOutCmd}'`;
         Logger.logCommand(`[CacheManager] Executing background cache shell command: ${execOutCmd}`);
         Logger.logCommand(`[CacheManager] Full subprocess command: ${fullAdbCommand}`);
@@ -412,6 +412,7 @@ exit "$tar_status"
     public async pullFileToCache(deviceId: string, workspaceRoot: string, relativePath: string): Promise<void> {
         const cacheDir = this.getCacheDir(deviceId, workspaceRoot);
         const adbPath = await this.connectionManager.toolsManager.getAdbPath();
+        const realDeviceId = await this.connectionManager.resolveDeviceId(deviceId);
         
         const safeWorkspaceRoot = escapePath(workspaceRoot);
         const safeRelPath = escapePath(relativePath);
@@ -439,8 +440,8 @@ exit "$tar_status"
                     fs.mkdirSync(cacheDir, { recursive: true });
                 }
                 
-                Logger.logCommand(`"${adbPath}" -s ${deviceId} exec-out '${execOutCmd}'`);
-                const adbProc = spawn(adbPath, ['-s', deviceId, 'exec-out', execOutCmd], {
+                Logger.logCommand(`"${adbPath}" -s ${realDeviceId} exec-out '${execOutCmd}'`);
+                const adbProc = spawn(adbPath, ['-s', realDeviceId, 'exec-out', execOutCmd], {
                     stdio: ['ignore', 'pipe', 'pipe']
                 });
                 

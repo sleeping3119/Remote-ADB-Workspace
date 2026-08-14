@@ -372,9 +372,10 @@ export class ConnectionManager {
         }
         try {
             const adbPath = await this.toolsManager.getAdbPath();
+            const realId = await this.resolveDeviceId(deviceId);
             const cp = require('child_process');
             return await new Promise((resolve) => {
-                cp.exec(`"${adbPath}" -s ${deviceId} shell id -un`, (err: any, stdout: string) => {
+                cp.exec(`"${adbPath}" -s ${realId} shell id -un`, (err: any, stdout: string) => {
                     resolve(stdout.trim() || 'shell');
                 });
             });
