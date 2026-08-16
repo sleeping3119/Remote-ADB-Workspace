@@ -136,7 +136,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const safePath = escapePath(targetPath);
         // Native shell tests to resolve symlinks and check permissions. 
         // Folders must have r_x, files must have r__. We append |1 for symlinks or |0 for normal files.
-        const shellCmd = `cd "${safePath}" 2>&1 || { echo "__CD_FAILED__"; exit; }; ls -1A 2>&1 | while IFS= read -r f; do is_sym="0"; [ -L "$f" ] && is_sym="1"; if [ -d "$f" ]; then [ -r "$f" ] && [ -x "$f" ] && printf "%s/|%s\\n" "$f" "$is_sym"; elif [ -f "$f" ]; then [ -r "$f" ] && printf "%s|%s\\n" "$f" "$is_sym"; fi; done`;
+        const shellCmd = `cd "${safePath}" 2>&1 || { echo "__CD_FAILED__"; exit; }; ls_out=$(ls -1A 2>&1); ret=$?; if [ $ret -ne 0 ]; then echo "$ls_out"; exit $ret; fi; if [ -n "$ls_out" ]; then echo "$ls_out" | while IFS= read -r f; do is_sym="0"; [ -L "$f" ] && is_sym="1"; if [ -d "$f" ]; then [ -r "$f" ] && [ -x "$f" ] && printf "%s/|%s\\n" "$f" "$is_sym"; elif [ -f "$f" ]; then [ -r "$f" ] && printf "%s|%s\\n" "$f" "$is_sym"; fi; done; fi`;
         const output = await shell.executeCommand(shellCmd);
         
         const isAccessError = output.includes('Permission denied') || 
