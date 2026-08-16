@@ -3,10 +3,12 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
-import { ConnectionManager } from '../adb/connectionManager';
+import * as cp from 'child_process';
+import { ConnectionManager, PersistentAdbShell } from '../adb/connectionManager';
 import { ToyboxManager } from '../adb/toyboxManager';
 import { CacheManager } from './cacheManager';
 import { escapePath } from '../utils/shellUtils';
+import { Logger } from '../logger';
 
 export interface AdbDirEntry {
     name: string;
@@ -134,10 +136,16 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const safePath = escapePath(targetPath);
         // Native shell tests to resolve symlinks and check permissions. 
         // Folders must have r_x, files must have r__. We append |1 for symlinks or |0 for normal files.
-        const shellCmd = `cd "${safePath}" 2>/dev/null && ls -1A | while IFS= read -r f; do is_sym="0"; [ -L "$f" ] && is_sym="1"; if [ -d "$f" ]; then [ -r "$f" ] && [ -x "$f" ] && printf "%s/|%s\\n" "$f" "$is_sym"; elif [ -f "$f" ]; then [ -r "$f" ] && printf "%s|%s\\n" "$f" "$is_sym"; fi; done`;
+        const shellCmd = `cd "${safePath}" 2>&1 || { echo "__CD_FAILED__"; exit; }; ls -1A 2>&1 | while IFS= read -r f; do is_sym="0"; [ -L "$f" ] && is_sym="1"; if [ -d "$f" ]; then [ -r "$f" ] && [ -x "$f" ] && printf "%s/|%s\\n" "$f" "$is_sym"; elif [ -f "$f" ]; then [ -r "$f" ] && printf "%s|%s\\n" "$f" "$is_sym"; fi; done`;
         const output = await shell.executeCommand(shellCmd);
         
-        if (output.includes('No such file') || output.includes('Not a directory') || output.includes('cd: ')) {
+        const isAccessError = output.includes('Permission denied') || 
+                              output.includes('__CD_FAILED__') || 
+                              output.includes('cd: ') ||
+                              output.includes('No such file') ||
+                              output.includes('Not a directory');
+
+        if (output.includes('No such file') || output.includes('Not a directory') || output.includes('__CD_FAILED__')) {
             // cd fails if it doesn't exist or permission denied
             if (!output.includes('Permission denied')) {
                 throw vscode.FileSystemError.FileNotFound(uri);
@@ -151,7 +159,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         for (const line of lines) {
             const cleaned = line.endsWith('\r') ? line.slice(0, -1) : line;
             if (!cleaned || cleaned === './' || cleaned === '../') continue;
-            if (cleaned.includes('Permission denied') || cleaned.includes('cd: ')) continue;
+            if (cleaned.includes('Permission denied') || cleaned.includes('cd: ') || cleaned.includes('__CD_FAILED__')) continue;
             
             const parts = cleaned.split('|');
             if (parts.length < 2) continue; // safety check
@@ -176,8 +184,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         }
         
         // Check local cache and delete files that aren't in legitimate output
-        // We only do this if we actually succeeded in reading (no "Permission denied" on cd itself)
-        if (!output.includes('Permission denied') && !output.includes('cd: ')) {
+        // We only do this if we actually succeeded in reading (no permission or CD access errors)
+        if (!isAccessError) {
             const workspaceFolder = this.getWorkspaceFolderForPath(uri);
             if (workspaceFolder) {
                 this.cacheManager.syncLocalCache(uri.authority, workspaceFolder.uri.path, targetPath, validNames).catch(e => {
@@ -189,6 +197,69 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         return entries;
     }
 
+
+    private async readRemoteFile(deviceId: string, targetPath: string, shell: PersistentAdbShell): Promise<Uint8Array> {
+        const adbPath = await this.connectionManager.toolsManager.getAdbPath();
+        const realDeviceId = await this.connectionManager.resolveDeviceId(deviceId);
+        const safePath = escapePath(targetPath);
+
+        const shellCmd = `cat "${safePath}"`;
+
+        const effectiveSwitchCmd = shell.activeSwitchCommand;
+        let execOutCmd = shellCmd;
+        if (effectiveSwitchCmd) {
+            const escapedCmd = shellCmd.replace(/'/g, "'\\''");
+            if (effectiveSwitchCmd.type === 'termux' || effectiveSwitchCmd.type === 'custom') {
+                const pkg = effectiveSwitchCmd.pkgName || (effectiveSwitchCmd.type === 'termux' ? 'com.termux' : '');
+                if (pkg) {
+                    execOutCmd = `run-as ${pkg} sh -c '${escapedCmd}'`;
+                }
+            } else if (effectiveSwitchCmd.type === 'root') {
+                execOutCmd = `su -c '${escapedCmd}'`;
+            }
+        }
+
+        try {
+            return await new Promise<Uint8Array>((resolve, reject) => {
+                const adbProc = cp.spawn(adbPath, ['-s', realDeviceId, 'exec-out', execOutCmd], {
+                    stdio: ['ignore', 'pipe', 'pipe']
+                });
+
+                const chunks: Buffer[] = [];
+                let stderr = '';
+
+                adbProc.stdout.on('data', (d: Buffer) => chunks.push(d));
+                adbProc.stderr.on('data', (d: Buffer) => stderr += d.toString());
+
+                adbProc.on('close', (code) => {
+                    if (code !== 0 && code !== null) {
+                        reject(new Error(`exec-out cat exited with code ${code}: ${stderr}`));
+                    } else {
+                        resolve(Buffer.concat(chunks));
+                    }
+                });
+
+                adbProc.on('error', (err) => reject(err));
+            });
+        } catch (err) {
+            Logger.logWarning(`[AdbFileSystemProvider] Direct cat via exec-out failed for ${targetPath}: ${err}. Falling back to base64...`);
+        }
+
+        // Fallback: Read via base64 in persistent shell
+        try {
+            const currentUser = await shell.getCurrentUser();
+            const prefix = await this.toyboxManager.getToyboxPrefix(deviceId, currentUser.name);
+            const b64Output = await shell.executeCommand(`${prefix} base64 "${safePath}" 2>/dev/null || base64 "${safePath}" 2>/dev/null`);
+            const sanitized = b64Output.replace(/\s+/g, '');
+            if (sanitized) {
+                return Buffer.from(sanitized, 'base64');
+            }
+        } catch (b64Err) {
+            Logger.logError(`[AdbFileSystemProvider] Base64 fallback failed for ${targetPath}: ${b64Err}`);
+        }
+
+        throw vscode.FileSystemError.Unavailable(`Cannot read file from device: ${targetPath}`);
+    }
 
     async readFile(uri: vscode.Uri): Promise<Uint8Array> {
         await this.connectionManager.waitForShellReady();
@@ -238,39 +309,23 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             }
         }
         
+        const parts = lastLine.split('|');
+        let remoteMtimeSecs = 0;
+        let remoteSize = -1;
+        if (parts[0] === 'OK' && parts.length === 3) {
+            remoteMtimeSecs = parseInt(parts[1], 10);
+            remoteSize = parseInt(parts[2], 10);
+        }
+
+        if (remoteSize === 0) {
+            return new Uint8Array(0);
+        }
+
         // 2. Resolve workspace folder to use cache
         const workspaceFolder = this.getWorkspaceFolderForPath(uri);
         
         if (!workspaceFolder) {
-            // Standalone file opened via file picker (not part of workspace)
-            // It might require root privileges to read (if user switched to root), 
-            // so we must copy it to a world-readable tmp directory first using the persistent shell!
-            const rawFolder = await this.toyboxManager.getRawFolderPath(deviceId, 'shell');
-            const tempRawFileName = 'pull_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
-            const safeTempRawPath = escapePath(path.posix.join(rawFolder, tempRawFileName));
-            
-            // Use the persistent shell to copy the file to the temp path and make it readable for adb pull
-            const cpCmd = `cp "${safePath}" "${safeTempRawPath}" && chmod 666 "${safeTempRawPath}" 2>&1 && echo "OK" || echo "ERR:$?"`;
-            const cpOutput = (await shell.executeCommand(cpCmd)).trim();
-            if (!cpOutput.endsWith("OK")) {
-                throw vscode.FileSystemError.Unavailable(`Failed to stage file for reading: ${cpOutput.replace('ERR', '').trim()}`);
-            }
-
-            const crypto = require('crypto');
-            const os = require('os');
-            const tempFilePath = path.join(os.tmpdir(), `adb_temp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
-            const safeTempFile = escapePath(tempFilePath);
-            try {
-                await this.connectionManager.executeCommandForDevice(deviceId, `pull "${safeTempRawPath}" "${safeTempFile}"`);
-                const content = await fs.promises.readFile(tempFilePath);
-                return content;
-            } finally {
-                if (fs.existsSync(tempFilePath)) {
-                    await fs.promises.unlink(tempFilePath).catch(() => {});
-                }
-                // Cleanup remote temp file using adb shell directly (runs as shell)
-                await this.connectionManager.executeCommandForDevice(deviceId, `shell rm -f "${safeTempRawPath}"`).catch(() => {});
-            }
+            return await this.readRemoteFile(deviceId, targetPath, shell);
         }
 
         const workspaceRoot = workspaceFolder.uri.path;
@@ -278,14 +333,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         const relativePath = targetPath.substring(workspaceFolder.uri.path.length).replace(/^\/+/, '');
         const cachedFilePath = path.join(cacheDir, relativePath);
 
-        const parts = lastLine.split('|');
         if (parts[0] === 'OK' && parts.length === 3) {
-            // stat "%Y" is epoch seconds. Cache mtime is stored from local stat, which is epoch ms, 
-            // but we can just normalize both to seconds for comparison to be safe, or just compare roughly.
-            // Wait, we stored `Math.floor(stat.mtimeMs)` in cacheManager. Let's compare seconds.
-            const remoteMtimeSecs = parseInt(parts[1], 10);
-            const remoteSize = parseInt(parts[2], 10);
-            
             let baseline = this.cacheManager.getBaseline(uri.authority, workspaceRoot, relativePath);
             
             // Lazily establish baseline if the file was populated by initializeCache (tar)
@@ -307,9 +355,6 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
 
             if (baseline) {
                 const baselineMtimeSecs = Math.floor(baseline.mtime / 1000);
-                // Due to local extraction, mtime might be slightly off. Actually, Android filesystem 
-                // might have different resolution. We primarily care about size or significant mtime changes.
-                // It's safest to invalidate if they don't match, as pulling is cheap.
                 if (baselineMtimeSecs !== remoteMtimeSecs || baseline.size !== remoteSize) {
                     if (fs.existsSync(cachedFilePath)) {
                         fs.unlinkSync(cachedFilePath);
@@ -317,8 +362,6 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                     this.cacheManager.removeBaseline(uri.authority, workspaceRoot, relativePath);
                 }
             } else if (fs.existsSync(cachedFilePath)) {
-                // No baseline and local stat didn't match remote stat, it means it changed 
-                // remotely after initializeCache extracted it. It's stale!
                 fs.unlinkSync(cachedFilePath);
             }
         }
@@ -333,8 +376,8 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
             return await fs.promises.readFile(cachedFilePath);
         }
         
-        // 3. If file still doesn't exist, it failed to extract (e.g. illegal windows characters like ':')
-        throw vscode.FileSystemError.Unavailable(`Cannot read file from device. (It might contain illegal characters for Windows, e.g., ':', or cannot be accessed.)`);
+        // 3. Fallback to direct remote read if cache extraction failed (e.g. invalid Windows character in path)
+        return await this.readRemoteFile(deviceId, targetPath, shell);
     }
 
     async writeFile(uri: vscode.Uri, content: Uint8Array, options: { create: boolean, overwrite: boolean }): Promise<void> {
@@ -435,8 +478,6 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
                     await fs.promises.writeFile(cachedFilePath, content);
                     localFileToPush = cachedFilePath;
                 } else {
-                    const crypto = require('crypto');
-                    const os = require('os');
                     const tempFilePath = path.join(os.tmpdir(), `adb_temp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
                     await fs.promises.writeFile(tempFilePath, content);
                     localFileToPush = tempFilePath;
