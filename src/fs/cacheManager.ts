@@ -97,6 +97,8 @@ export class CacheManager {
             return;
         }
 
+        await this.connectionManager.waitForShellReady();
+
         Logger.logOutput(`[CacheManager] Initializing cache for ${workspaceRoot}...`);
         
         const cacheDir = this.getCacheDir(deviceId, workspaceRoot);
@@ -141,12 +143,20 @@ printf 'COMPLETE\\nEXIT=%s\\n' "$tar_status" > "${safeStatusFile}"
 exit "$tar_status"
 `.trim();
         
+        const manifestsMap: Record<string, any> = this.context.workspaceState.get('adbValidationManifests') || {};
+        const folderKey = `${deviceId}:${workspaceRoot}`;
+        const folderManifest = manifestsMap[folderKey] || this.context.workspaceState.get<any>('adbValidationManifest');
+        const effectiveSwitchCmd = shell.activeSwitchCommand || folderManifest?.switchCommand;
+
         let execOutCmd = shellCmd;
-        if (shell.activeSwitchCommand) {
+        if (effectiveSwitchCmd) {
             const escapedCmd = shellCmd.replace(/'/g, "'\\''");
-            if (shell.activeSwitchCommand.type === 'termux' || shell.activeSwitchCommand.type === 'custom') {
-                execOutCmd = `run-as ${shell.activeSwitchCommand.pkgName} sh -c '${escapedCmd}'`;
-            } else if (shell.activeSwitchCommand.type === 'root') {
+            if (effectiveSwitchCmd.type === 'termux' || effectiveSwitchCmd.type === 'custom') {
+                const pkg = effectiveSwitchCmd.pkgName || (effectiveSwitchCmd.type === 'termux' ? 'com.termux' : '');
+                if (pkg) {
+                    execOutCmd = `run-as ${pkg} sh -c '${escapedCmd}'`;
+                }
+            } else if (effectiveSwitchCmd.type === 'root') {
                 execOutCmd = `su -c '${escapedCmd}'`;
             }
         }
@@ -410,6 +420,7 @@ exit "$tar_status"
     }
 
     public async pullFileToCache(deviceId: string, workspaceRoot: string, relativePath: string): Promise<void> {
+        await this.connectionManager.waitForShellReady();
         const cacheDir = this.getCacheDir(deviceId, workspaceRoot);
         const adbPath = await this.connectionManager.toolsManager.getAdbPath();
         const realDeviceId = await this.connectionManager.resolveDeviceId(deviceId);
@@ -420,12 +431,20 @@ exit "$tar_status"
         const shellCmd = `cd "${safeWorkspaceRoot}" && toybox tar chf - "${safeRelPath}" 2>/dev/null`;
         
         const shell = await this.connectionManager.getPersistentShell(deviceId);
+        const manifestsMap: Record<string, any> = this.context.workspaceState.get('adbValidationManifests') || {};
+        const folderKey = `${deviceId}:${workspaceRoot}`;
+        const folderManifest = manifestsMap[folderKey] || this.context.workspaceState.get<any>('adbValidationManifest');
+        const effectiveSwitchCmd = shell.activeSwitchCommand || folderManifest?.switchCommand;
+
         let execOutCmd = shellCmd;
-        if (shell.activeSwitchCommand) {
+        if (effectiveSwitchCmd) {
             const escapedCmd = shellCmd.replace(/'/g, "'\\''");
-            if (shell.activeSwitchCommand.type === 'termux' || shell.activeSwitchCommand.type === 'custom') {
-                execOutCmd = `run-as ${shell.activeSwitchCommand.pkgName} sh -c '${escapedCmd}'`;
-            } else if (shell.activeSwitchCommand.type === 'root') {
+            if (effectiveSwitchCmd.type === 'termux' || effectiveSwitchCmd.type === 'custom') {
+                const pkg = effectiveSwitchCmd.pkgName || (effectiveSwitchCmd.type === 'termux' ? 'com.termux' : '');
+                if (pkg) {
+                    execOutCmd = `run-as ${pkg} sh -c '${escapedCmd}'`;
+                }
+            } else if (effectiveSwitchCmd.type === 'root') {
                 execOutCmd = `su -c '${escapedCmd}'`;
             }
         }

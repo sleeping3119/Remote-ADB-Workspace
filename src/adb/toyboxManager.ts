@@ -26,7 +26,8 @@ export class ToyboxManager {
     }
 
     public async getToyboxPrefix(deviceId: string, username: string = 'shell'): Promise<string> {
-        const key = `${deviceId}_${username}`;
+        const realId = await this.connectionManager.resolveDeviceId(deviceId);
+        const key = `${realId}_${username}`;
         if (this.cachedPrefixes.has(key)) {
             return this.cachedPrefixes.get(key)!;
         }
@@ -35,7 +36,7 @@ export class ToyboxManager {
             return this.pendingPrefixes.get(key)!;
         }
 
-        const promise = this._resolveToyboxPrefix(deviceId, username);
+        const promise = this._resolveToyboxPrefix(realId, username);
         this.pendingPrefixes.set(key, promise);
 
         try {
@@ -48,19 +49,21 @@ export class ToyboxManager {
     }
 
     public setToyboxPrefix(deviceId: string, username: string, prefix: string): void {
-        const key = `${deviceId}_${username}`;
+        const realId = this.connectionManager.getRealDeviceIdSync(deviceId);
+        const key = `${realId}_${username}`;
         this.cachedPrefixes.set(key, prefix);
     }
 
     public async getRawFolderPath(deviceId: string, username: string = 'shell', shell?: import('./connectionManager').PersistentAdbShell): Promise<string> {
-        const key = `${deviceId}_${username}`;
+        const realId = await this.connectionManager.resolveDeviceId(deviceId);
+        const key = `${realId}_${username}`;
         const folderPath = this.rawFolderPaths.get(key) || RAW_DIR;
         
         if (folderPath === RAW_DIR) {
             try {
-                await this.execAdb(deviceId, `shell mkdir -p ${RAW_DIR}`);
+                await this.execAdb(realId, `shell mkdir -p ${RAW_DIR}`);
                 // Use 777 to allow apps like termux to read/write files pushed here by adb host
-                await this.execAdb(deviceId, `shell chmod 777 ${RAW_DIR}`);
+                await this.execAdb(realId, `shell chmod 777 ${RAW_DIR}`);
             } catch (e) {}
         } else if (shell) {
             try {
@@ -73,7 +76,8 @@ export class ToyboxManager {
     }
 
     public setRawFolderPath(deviceId: string, username: string, path: string): void {
-        const key = `${deviceId}_${username}`;
+        const realId = this.connectionManager.getRealDeviceIdSync(deviceId);
+        const key = `${realId}_${username}`;
         this.rawFolderPaths.set(key, path);
     }
 

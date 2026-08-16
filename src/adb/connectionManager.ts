@@ -358,9 +358,19 @@ export class ConnectionManager {
         return shellPromise;
     }
 
+    public getRealDeviceIdSync(idFromUri: string): string {
+        const lower = idFromUri.toLowerCase();
+        if (this.androidToAdbIdMap.has(idFromUri)) {
+            return this.androidToAdbIdMap.get(idFromUri)!;
+        }
+        if (this.deviceIdMap.has(lower)) {
+            return this.deviceIdMap.get(lower)!;
+        }
+        return idFromUri;
+    }
+
     public getPersistentShellIfExists(deviceId: string): PersistentAdbShell | undefined {
-        const lower = deviceId.toLowerCase();
-        const realId = this.deviceIdMap.get(lower) || deviceId;
+        const realId = this.getRealDeviceIdSync(deviceId);
         return this.shells.get(realId);
     }
 

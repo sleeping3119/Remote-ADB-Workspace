@@ -110,7 +110,63 @@ export async function activate(context: vscode.ExtensionContext) {
         updateStatusBar();
     })();
 
-    // If we are opening a remote-adb workspace, retrieve the manifest and log it
+    async function processAdbFolderManifest(
+        targetDeviceId: string,
+        targetFolderPath: string,
+        manifestsMap: Record<string, any>
+    ): Promise<any> {
+        const key = `${targetDeviceId}:${targetFolderPath}`;
+        const tempKey = `adbValidationManifest_${sanitizeKey(targetDeviceId)}_${sanitizeKey(targetFolderPath)}.json`;
+        const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
+
+        let slimManifest: any = undefined;
+        try {
+            const fs = require('fs');
+            if (fs.existsSync(manifestUri.fsPath)) {
+                const data = await fs.promises.readFile(manifestUri.fsPath);
+                const fullManifest = JSON.parse(data.toString());
+                Logger.logOutput(`[Extension Activate] Found global manifest file for ${targetFolderPath}. Processing slim manifest for workspace state.`);
+                Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(fullManifest, null, 2)}`);
+
+                slimManifest = {
+                    workspaceRoot: fullManifest.workspaceRoot,
+                    user: fullManifest.privilegeContext?.user || 'shell',
+                    switchCommand: fullManifest.privilegeContext?.switchCommand
+                };
+                manifestsMap[key] = slimManifest;
+                await fs.promises.unlink(manifestUri.fsPath).catch(() => {});
+            }
+        } catch (e) {
+            Logger.logError(`[Extension Activate] Error reading manifest for ${targetFolderPath}: ${e}`);
+        }
+
+        if (!slimManifest && manifestsMap[key]) {
+            slimManifest = manifestsMap[key];
+        }
+
+        if (!slimManifest) {
+            const legacy = context.workspaceState.get<any>('adbValidationManifest');
+            if (legacy && (legacy.workspaceRoot === targetFolderPath || legacy.workspaceRoot?.replace(/\/+$/, '') === targetFolderPath.replace(/\/+$/, ''))) {
+                slimManifest = legacy;
+                manifestsMap[key] = slimManifest;
+            }
+        }
+
+        if (slimManifest && context.storageUri) {
+            try {
+                await vscode.workspace.fs.createDirectory(context.storageUri);
+                const perFolderManifestUri = vscode.Uri.joinPath(context.storageUri, `manifest_${sanitizeKey(targetDeviceId)}_${sanitizeKey(targetFolderPath)}.json`);
+                await vscode.workspace.fs.writeFile(perFolderManifestUri, new TextEncoder().encode(JSON.stringify(slimManifest, null, 2)));
+                Logger.logOutput(`[Extension Activate] Saved per-folder manifest to workspace storage: ${perFolderManifestUri.fsPath}`);
+            } catch (e) {
+                Logger.logError(`[Extension Activate] Failed to write per-folder manifest: ${e}`);
+            }
+        }
+
+        return slimManifest;
+    }
+
+    // If we are opening a remote-adb workspace, retrieve the manifests and initialize cache
     const adbFolders = vscode.workspace.workspaceFolders?.filter(f => f.uri.scheme === 'remote-adb');
     if (adbFolders && adbFolders.length > 0) {
         // Create an initialization lock IMMEDIATELY to block early FS operations
@@ -119,176 +175,166 @@ export async function activate(context: vscode.ExtensionContext) {
         connectionManager.setShellInitializing(initPromise);
 
         try {
-            const folder = adbFolders[0];
-            const deviceId = folder.uri.authority;
-            const folderPath = folder.uri.path;
-        
-        const tempKey = `adbValidationManifest_${sanitizeKey(deviceId)}_${sanitizeKey(folderPath)}.json`;
-        const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
-        
-        Logger.logOutput(`[Extension Activate] Checking for manifest at: ${manifestUri.fsPath}`);
-        
-        let fullManifest: any = undefined;
-        let slimManifest: any = undefined;
-        try {
-            const fs = require('fs');
-            const data = await fs.promises.readFile(manifestUri.fsPath);
-            fullManifest = JSON.parse(data.toString());
-            Logger.logOutput(`[Extension Activate] Found global manifest file. Processing slim manifest for workspace state.`);
-            
-            // Log full manifest
-            Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(fullManifest, null, 2)}`);
-            
-            // Create slim manifest
-            slimManifest = {
-                workspaceRoot: fullManifest.workspaceRoot,
-                user: fullManifest.privilegeContext?.user || 'shell',
-                switchCommand: fullManifest.privilegeContext?.switchCommand
-            };
-            
-            // Save slim manifest to workspace state
-            context.workspaceState.update('adbValidationManifest', slimManifest);
-            
-            // Also write slim manifest to physical workspace storage
-            if (context.storageUri) {
-                await vscode.workspace.fs.createDirectory(context.storageUri);
-                const localManifestUri = vscode.Uri.joinPath(context.storageUri, 'manifest.json');
-                await vscode.workspace.fs.writeFile(localManifestUri, new TextEncoder().encode(JSON.stringify(slimManifest, null, 2)));
-                Logger.logOutput(`[Extension Activate] Saved slim manifest to workspace storage: ${localManifestUri.fsPath}`);
-            }
-            
-            try {
-                await fs.promises.unlink(manifestUri.fsPath);
-            } catch (e) {
-                // Ignore delete errors
-            }
-        } catch (e) {
-            // File not found, fallback to workspace state
-            slimManifest = context.workspaceState.get('adbValidationManifest');
-            Logger.logOutput(`[Extension Activate] No global manifest file found. Checked workspaceState: ${slimManifest ? 'Found' : 'Not Found'}`);
-            if (slimManifest) {
-                Logger.logOutput(`[ADB Workspace Slim Manifest]\n${JSON.stringify(slimManifest, null, 2)}`);
-            }
-        }
-        
-        if (slimManifest) {
-            // Try to resolve the androidId. If it's not found, wait for autoConnectPromise to see if it connects.
-            let adbId = await connectionManager.resolveDeviceId(deviceId);
-            if (adbId === deviceId) {
-                Logger.logOutput(`[Extension Activate] Device with Android ID ${deviceId} not found, waiting for auto-connects to finish...`);
-                await autoConnectPromise;
-                adbId = await connectionManager.resolveDeviceId(deviceId);
-                if (adbId === deviceId) {
-                    vscode.window.showErrorMessage(`ADB Workspace failed to load: Device with Android ID ${deviceId} is not connected.`);
+            const primaryFolder = adbFolders[0];
+            const primaryDeviceId = primaryFolder.uri.authority;
+            const manifestsMap: Record<string, any> = context.workspaceState.get('adbValidationManifests') || {};
+            let primarySlimManifest: any = undefined;
+
+            for (const folder of adbFolders) {
+                const deviceId = folder.uri.authority;
+                const folderPath = folder.uri.path;
+                const slimManifest = await processAdbFolderManifest(deviceId, folderPath, manifestsMap);
+                if (folder === primaryFolder) {
+                    primarySlimManifest = slimManifest;
                 }
             }
 
-            try {
-                // Auto-restore environment if required
-                const switchCmd = slimManifest.switchCommand;
-                if (switchCmd && switchCmd.type !== 'shell') {
-                    const shell = await connectionManager.getPersistentShell(deviceId);
-                    const currentUser = await shell.getCurrentUser();
+            await context.workspaceState.update('adbValidationManifests', manifestsMap);
+
+            if (primarySlimManifest) {
+                await context.workspaceState.update('adbValidationManifest', primarySlimManifest);
+                if (context.storageUri) {
+                    const localManifestUri = vscode.Uri.joinPath(context.storageUri, 'manifest.json');
+                    await vscode.workspace.fs.writeFile(localManifestUri, new TextEncoder().encode(JSON.stringify(primarySlimManifest, null, 2)));
+                    Logger.logOutput(`[Extension Activate] Saved primary slim manifest to workspace storage: ${localManifestUri.fsPath}`);
+                }
+
+                // Try to resolve the androidId. If it's not found, wait for autoConnectPromise to see if it connects.
+                let adbId = await connectionManager.resolveDeviceId(primaryDeviceId);
+                if (adbId === primaryDeviceId) {
+                    Logger.logOutput(`[Extension Activate] Device with Android ID ${primaryDeviceId} not found, waiting for auto-connects to finish...`);
+                    await autoConnectPromise;
+                    adbId = await connectionManager.resolveDeviceId(primaryDeviceId);
+                    if (adbId === primaryDeviceId) {
+                        vscode.window.showErrorMessage(`ADB Workspace failed to load: Device with Android ID ${primaryDeviceId} is not connected.`);
+                    }
+                }
+
+                try {
+                    // Auto-restore environment if required
+                    const switchCmd = primarySlimManifest.switchCommand;
+                    if (switchCmd && switchCmd.type !== 'shell') {
+                        const shell = await connectionManager.getPersistentShell(primaryDeviceId);
+                        const currentUser = await shell.getCurrentUser();
+                        
+                        if (currentUser.name === 'shell') {
+                            Logger.logOutput(`[Extension Activate] Restoring active user environment: ${switchCmd.type}`);
+                            if (switchCmd.type === 'root') {
+                                await shell.sendRawCommand('su');
+                                shell.refreshCurrentUser();
+                                shell.activeSwitchCommand = { type: 'root' };
+                            } else if (switchCmd.type === 'termux') {
+                                await setupAppEnvironment(adbId, 'com.termux', shell, './files/home/.raw');
+                            } else if (switchCmd.type === 'custom' && switchCmd.pkgName) {
+                                await setupAppEnvironment(adbId, switchCmd.pkgName, shell);
+                            }
+                        }
+                    }
+                } catch (err: any) {
+                    Logger.logError(`[Extension Activate] Failed to restore environment: ${err.message}`);
+                }
+
+                const createProfile = async () => {
+                    const adbPath = await toolsManager.getAdbPath();
+                    const root = primarySlimManifest.workspaceRoot;
+                    const realId = await connectionManager.resolveDeviceId(primaryDeviceId);
+                    let shellArgs = ['-s', realId, 'shell', '-t'];
+                    const switchCmd = primarySlimManifest.switchCommand;
                     
-                    if (currentUser.name === 'shell') {
-                        Logger.logOutput(`[Extension Activate] Restoring active user environment: ${switchCmd.type}`);
-                        if (switchCmd.type === 'root') {
-                            await shell.sendRawCommand('su');
-                            shell.refreshCurrentUser();
-                            shell.activeSwitchCommand = { type: 'root' };
-                        } else if (switchCmd.type === 'termux') {
-                            await setupAppEnvironment(adbId, 'com.termux', shell, './files/home/.raw');
-                        } else if (switchCmd.type === 'custom' && switchCmd.pkgName) {
-                            await setupAppEnvironment(adbId, switchCmd.pkgName, shell);
+                    if (switchCmd && switchCmd.type !== 'shell') {
+                        if (switchCmd.type === 'termux') {
+                            shellArgs.push('run-as', 'com.termux', 'sh', '-c', `\"cd '${root}' && exec sh\"`);
+                        } else if (switchCmd.type === 'custom') {
+                            shellArgs.push('run-as', switchCmd.pkgName!, 'sh', '-c', `\"cd '${root}' && exec sh\"`);
+                        } else if (switchCmd.type === 'root') {
+                            shellArgs.push('su');
+                        }
+                    } else {
+                        shellArgs.push('sh', '-c', `\"cd '${root}' && exec sh\"`);
+                    }
+
+                    return new vscode.TerminalProfile({
+                        name: 'ADB Shell',
+                        shellPath: adbPath,
+                        shellArgs: shellArgs,
+                        iconPath: new vscode.ThemeIcon('terminal-linux')
+                    });
+                };
+
+                reopenWorkspaceTerminal = async (reconnectedDeviceId: string) => {
+                    const realId = await connectionManager.resolveDeviceId(primaryDeviceId);
+                    const reconnectedRealId = await connectionManager.resolveDeviceId(reconnectedDeviceId);
+                    if (reconnectedRealId === realId) {
+                        const existing = vscode.window.terminals.find(t => t.name === 'ADB Shell' && t.exitStatus === undefined);
+                        if (!existing) {
+                            try {
+                                const profile = await createProfile();
+                                const terminal = vscode.window.createTerminal(profile.options as vscode.TerminalOptions);
+                                terminal.show();
+                            } catch (e) {
+                                Logger.logError(`Failed to reopen terminal: ${e}`);
+                            }
                         }
                     }
-                }
-            } catch (err: any) {
-                Logger.logError(`[Extension Activate] Failed to restore environment: ${err.message}`);
-            }
-        } else {
-            Logger.logOutput(`[Extension Activate] No manifest available.`);
-        }
-        
-        if (slimManifest) {
-            const createProfile = async () => {
-                const adbPath = await toolsManager.getAdbPath();
-                const root = slimManifest.workspaceRoot;
-                const realId = await connectionManager.resolveDeviceId(deviceId);
-                let shellArgs = ['-s', realId, 'shell', '-t'];
-                const switchCmd = slimManifest.switchCommand;
-                
-                if (switchCmd && switchCmd.type !== 'shell') {
-                    if (switchCmd.type === 'termux') {
-                        shellArgs.push('run-as', 'com.termux', 'sh', '-c', `\"cd '${root}' && exec sh\"`);
-                    } else if (switchCmd.type === 'custom') {
-                        shellArgs.push('run-as', switchCmd.pkgName!, 'sh', '-c', `\"cd '${root}' && exec sh\"`);
-                    } else if (switchCmd.type === 'root') {
-                        shellArgs.push('su');
-                    }
-                } else {
-                    shellArgs.push('sh', '-c', `\"cd '${root}' && exec sh\"`);
-                }
+                };
 
-                return new vscode.TerminalProfile({
-                    name: 'ADB Shell',
-                    shellPath: adbPath,
-                    shellArgs: shellArgs,
-                    iconPath: new vscode.ThemeIcon('terminal-linux')
+                context.subscriptions.push(vscode.window.registerTerminalProfileProvider('remote-adb.terminalProfile', {
+                    provideTerminalProfile(token: vscode.CancellationToken): vscode.ProviderResult<vscode.TerminalProfile> {
+                        return createProfile();
+                    }
+                }));
+
+                // Automatically open the terminal when workspace starts
+                createProfile().then(profile => {
+                    const terminal = vscode.window.createTerminal(profile.options as vscode.TerminalOptions);
+                    terminal.show();
+                }).catch(e => {
+                    Logger.logError(`[Extension Activate] Failed to auto-start terminal: ${e}`);
                 });
-            };
 
-            reopenWorkspaceTerminal = async (reconnectedDeviceId: string) => {
-                const realId = await connectionManager.resolveDeviceId(deviceId);
-                const reconnectedRealId = await connectionManager.resolveDeviceId(reconnectedDeviceId);
-                if (reconnectedRealId === realId) {
-                    const existing = vscode.window.terminals.find(t => t.name === 'ADB Shell' && t.exitStatus === undefined);
-                    if (!existing) {
-                        try {
-                            const profile = await createProfile();
-                            const terminal = vscode.window.createTerminal(profile.options as vscode.TerminalOptions);
-                            terminal.show();
-                        } catch (e) {
-                            Logger.logError(`Failed to reopen terminal: ${e}`);
-                        }
+                // Listen for newly opened ADB Shell terminals to inject root commands
+                context.subscriptions.push(vscode.window.onDidOpenTerminal(terminal => {
+                    if (terminal.name === 'ADB Shell' && primarySlimManifest.switchCommand?.type === 'root') {
+                        // Send the directory change command directly to the interactive root shell
+                        terminal.sendText(`cd '${primarySlimManifest.workspaceRoot}' && clear`);
                     }
-                }
-            };
-
-            context.subscriptions.push(vscode.window.registerTerminalProfileProvider('remote-adb.terminalProfile', {
-                provideTerminalProfile(token: vscode.CancellationToken): vscode.ProviderResult<vscode.TerminalProfile> {
-                    return createProfile();
-                }
-            }));
-
-            // Automatically open the terminal when workspace starts
-            createProfile().then(profile => {
-                const terminal = vscode.window.createTerminal(profile.options as vscode.TerminalOptions);
-                terminal.show();
-            }).catch(e => {
-                Logger.logError(`[Extension Activate] Failed to auto-start terminal: ${e}`);
-            });
-
-            // Listen for newly opened ADB Shell terminals to inject root commands
-            context.subscriptions.push(vscode.window.onDidOpenTerminal(terminal => {
-                if (terminal.name === 'ADB Shell' && slimManifest.switchCommand?.type === 'root') {
-                    // Send the directory change command directly to the interactive root shell
-                    terminal.sendText(`cd '${slimManifest.workspaceRoot}' && clear`);
-                }
-            }));
-
-            // We do not await this so it runs in the background
-            cacheManager.initializeCache(deviceId, slimManifest.workspaceRoot).catch(e => {
-                Logger.logError(`[Extension Activate] Cache initialization failed: ${e}`);
-            });
-        }
-        
-        // Ensure the Explorer view is brought to focus
-        vscode.commands.executeCommand('workbench.view.explorer');
+                }));
+            } else {
+                Logger.logOutput(`[Extension Activate] No manifest available.`);
+            }
+            
+            // Ensure the Explorer view is brought to focus
+            vscode.commands.executeCommand('workbench.view.explorer');
         } finally {
             resolveInit();
         }
+
+        // Trigger cache initialization for every folder AFTER environment is restored and shell is ready
+        for (const folder of adbFolders) {
+            const deviceId = folder.uri.authority;
+            const folderPath = folder.uri.path;
+            cacheManager.initializeCache(deviceId, folderPath).catch(e => {
+                Logger.logError(`[Extension Activate] Cache initialization failed for ${folderPath}: ${e}`);
+            });
+        }
     }
+
+    // Dynamic workspace folders listener
+    context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(async (e) => {
+        const manifestsMap: Record<string, any> = context.workspaceState.get('adbValidationManifests') || {};
+        for (const folder of e.added) {
+            if (folder.uri.scheme === 'remote-adb') {
+                const deviceId = folder.uri.authority;
+                const folderPath = folder.uri.path;
+                Logger.logOutput(`[Workspace Folder Added] Initializing cache for added folder: ${folderPath}`);
+                await processAdbFolderManifest(deviceId, folderPath, manifestsMap);
+                await context.workspaceState.update('adbValidationManifests', manifestsMap);
+                cacheManager.initializeCache(deviceId, folderPath).catch(err => {
+                    Logger.logError(`[Workspace Folder Added] Cache initialization failed for ${folderPath}: ${err}`);
+                });
+            }
+        }
+    }));
     // Command: Switch Device
     let switchDeviceDisposable = vscode.commands.registerCommand('remote-adb.switchDevice', async () => {
         const devices = await connectionManager.getDevices();
@@ -354,53 +400,113 @@ export async function activate(context: vscode.ExtensionContext) {
                 }
             }
         
-        const shell = await connectionManager.getPersistentShell(active);
-        const pwd = await shell.executeCommand('pwd');
-        let initialPath = pwd.trim() || '/';
-        const user = await shell.getCurrentUser();
-        if (shell.activeSwitchCommand?.type === 'termux') {
-            initialPath = '/data/user/0/com.termux/files/home/';
-        } else if (user.name === 'shell' && initialPath === '/') {
-            initialPath = '/data/local/tmp';
-        }
-        const folderPath = await showFolderPicker(active, fsProvider, initialPath);
-        if (folderPath) {
-            // Stage 1-6: Target Path Validation Phase
-            const manifest = await validationManager.validateWorkspace(active, folderPath);
-            if (!manifest) {
-                // User aborted or validation failed terminally
-                return;
+            const shell = await connectionManager.getPersistentShell(active);
+            const pwd = await shell.executeCommand('pwd');
+            let initialPath = pwd.trim() || '/';
+            const user = await shell.getCurrentUser();
+            if (shell.activeSwitchCommand?.type === 'termux') {
+                initialPath = '/data/user/0/com.termux/files/home/';
+            } else if (user.name === 'shell' && initialPath === '/') {
+                initialPath = '/data/local/tmp';
             }
-            
-            // Persist the manifest to global storage for workspace reload scenarios
-            const androidId = await connectionManager.resolveAndroidIdForDevice(active) || active;
-            const tempKey = `adbValidationManifest_${sanitizeKey(androidId)}_${sanitizeKey(folderPath)}.json`;
-            const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
-            
-            try {
-                // Ensure the global storage directory exists
-                await vscode.workspace.fs.createDirectory(context.globalStorageUri);
-                // Write the manifest to disk
-                const data = new TextEncoder().encode(JSON.stringify(manifest));
-                await vscode.workspace.fs.writeFile(manifestUri, data);
-                Logger.logOutput(`[Validation] Saved manifest to disk: ${manifestUri.fsPath}`);
-            } catch (e: any) {
-                Logger.logError(`[Validation] Failed to save manifest to disk: ${e.message}`);
+            const folderPath = await showFolderPicker(active, fsProvider, initialPath);
+            if (folderPath) {
+                const androidId = await connectionManager.resolveAndroidIdForDevice(active) || active;
+                const existingAdbFolders = vscode.workspace.workspaceFolders?.filter(f => f.uri.scheme === 'remote-adb') || [];
+
+                // Check device mismatch if adding to existing workspace
+                if (existingAdbFolders.length > 0) {
+                    const existingAndroidId = existingAdbFolders[0].uri.authority;
+                    if (existingAndroidId !== androidId) {
+                        const choice = await vscode.window.showWarningMessage(
+                            `Device Mismatch: The current workspace is connected to device (${existingAndroidId}), but the selected folder belongs to device (${active}). A single workspace can only contain folders from the same device.`,
+                            { modal: true },
+                            'Open in New Window'
+                        );
+                        if (choice === 'Open in New Window') {
+                            const manifest = await validationManager.validateWorkspace(active, folderPath);
+                            if (!manifest) return;
+                            const tempKey = `adbValidationManifest_${sanitizeKey(androidId)}_${sanitizeKey(folderPath)}.json`;
+                            const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
+                            await vscode.workspace.fs.createDirectory(context.globalStorageUri);
+                            await vscode.workspace.fs.writeFile(manifestUri, new TextEncoder().encode(JSON.stringify(manifest)));
+                            await new Promise(resolve => setTimeout(resolve, 500));
+                            vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.parse(`remote-adb://${androidId}${folderPath}`), { forceNewWindow: true });
+                        }
+                        return;
+                    }
+                }
+
+                // Stage 1-6: Target Path Validation Phase
+                const manifest = await validationManager.validateWorkspace(active, folderPath);
+                if (!manifest) {
+                    // User aborted or validation failed terminally
+                    return;
+                }
+
+                // Check user/privilege environment compatibility if adding to existing workspace
+                if (existingAdbFolders.length > 0) {
+                    const manifestsMap: Record<string, any> = context.workspaceState.get('adbValidationManifests') || {};
+                    const primaryKey = `${existingAdbFolders[0].uri.authority}:${existingAdbFolders[0].uri.path}`;
+                    const primaryManifest = manifestsMap[primaryKey] || context.workspaceState.get<any>('adbValidationManifest');
+                    const workspaceSwitchCmd = primaryManifest?.switchCommand || { type: 'shell' };
+                    const workspaceUser = primaryManifest?.user || 'shell';
+
+                    const targetSwitchCmd = manifest.privilegeContext?.switchCommand || { type: 'shell' };
+
+                    const isSameEnv = (targetSwitchCmd.type === workspaceSwitchCmd.type) && 
+                                      (targetSwitchCmd.type !== 'custom' || targetSwitchCmd.pkgName === (workspaceSwitchCmd as any).pkgName);
+
+                    if (!isSameEnv) {
+                        const workspaceEnvLabel = workspaceSwitchCmd.type === 'custom' ? (workspaceSwitchCmd as any).pkgName : workspaceSwitchCmd.type;
+                        const targetEnvLabel = targetSwitchCmd.type === 'custom' ? targetSwitchCmd.pkgName : targetSwitchCmd.type;
+                        const targetUserLabel = manifest.privilegeContext?.user || 'shell';
+
+                        const choice = await vscode.window.showWarningMessage(
+                            `User Environment Mismatch: The current workspace is configured for user '${workspaceUser}' (${workspaceEnvLabel}), but the selected folder requires '${targetUserLabel}' (${targetEnvLabel}). A single workspace cannot mix different active user environments. Please close the current workspace first or open this folder in a new window.`,
+                            { modal: true },
+                            'Open in New Window'
+                        );
+                        if (choice === 'Open in New Window') {
+                            const tempKey = `adbValidationManifest_${sanitizeKey(androidId)}_${sanitizeKey(folderPath)}.json`;
+                            const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
+                            await vscode.workspace.fs.createDirectory(context.globalStorageUri);
+                            await vscode.workspace.fs.writeFile(manifestUri, new TextEncoder().encode(JSON.stringify(manifest)));
+                            await new Promise(resolve => setTimeout(resolve, 500));
+                            vscode.commands.executeCommand('vscode.openFolder', vscode.Uri.parse(`remote-adb://${androidId}${folderPath}`), { forceNewWindow: true });
+                        }
+                        return;
+                    }
+                }
+                
+                // Persist the manifest to global storage for workspace reload scenarios
+                const tempKey = `adbValidationManifest_${sanitizeKey(androidId)}_${sanitizeKey(folderPath)}.json`;
+                const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
+                
+                try {
+                    // Ensure the global storage directory exists
+                    await vscode.workspace.fs.createDirectory(context.globalStorageUri);
+                    // Write the manifest to disk
+                    const data = new TextEncoder().encode(JSON.stringify(manifest));
+                    await vscode.workspace.fs.writeFile(manifestUri, data);
+                    Logger.logOutput(`[Validation] Saved manifest to disk: ${manifestUri.fsPath}`);
+                } catch (e: any) {
+                    Logger.logError(`[Validation] Failed to save manifest to disk: ${e.message}`);
+                }
+                
+                // Log immediately in case the window doesn't reload
+                Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(manifest, null, 2)}`);
+
+                // Give the extension host file system a moment to physically flush the JSON file 
+                // before the restart caused by updateWorkspaceFolders.
+                await new Promise(resolve => setTimeout(resolve, 500));
+
+                vscode.workspace.updateWorkspaceFolders(
+                    vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders.length : 0,
+                    0,
+                    { uri: vscode.Uri.parse(`remote-adb://${androidId}${folderPath}`), name: `ADB: ${active}${folderPath}` }
+                );
             }
-            
-            // Log immediately in case the window doesn't reload
-            Logger.logOutput(`[ADB Workspace Validation Manifest]\n${JSON.stringify(manifest, null, 2)}`);
-
-            // Give the extension host file system a moment to physically flush the JSON file 
-            // before the brutal restart caused by updateWorkspaceFolders.
-            await new Promise(resolve => setTimeout(resolve, 500));
-
-            vscode.workspace.updateWorkspaceFolders(
-                vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders.length : 0,
-                0,
-                { uri: vscode.Uri.parse(`remote-adb://${androidId}${folderPath}`), name: `ADB: ${active}${folderPath}` }
-            );
-        }
         } catch (error: any) {
             if (error.message && (error.message.includes('ADB shell closed') || error.message.includes('ADB shell is dead'))) {
                 vscode.window.showErrorMessage(`Action failed: You are no longer connected to the device.`);
@@ -557,6 +663,26 @@ export async function activate(context: vscode.ExtensionContext) {
 
     async function switchDeviceUser(deviceId: string, targetUser: string, customApp?: string): Promise<boolean> {
         try {
+            const existingAdbFolders = vscode.workspace.workspaceFolders?.filter(f => f.uri.scheme === 'remote-adb') || [];
+            if (existingAdbFolders.length > 0) {
+                const manifestsMap: Record<string, any> = context.workspaceState.get('adbValidationManifests') || {};
+                const primaryKey = `${existingAdbFolders[0].uri.authority}:${existingAdbFolders[0].uri.path}`;
+                const primaryManifest = manifestsMap[primaryKey] || context.workspaceState.get<any>('adbValidationManifest');
+                const workspaceSwitchCmd = primaryManifest?.switchCommand || { type: 'shell' };
+                const workspaceEnv = workspaceSwitchCmd.type === 'custom' ? (workspaceSwitchCmd as any).pkgName : workspaceSwitchCmd.type;
+                
+                if (targetUser !== workspaceSwitchCmd.type || (targetUser === 'custom' && customApp?.trim() !== (workspaceSwitchCmd as any).pkgName)) {
+                    const choice = await vscode.window.showWarningMessage(
+                        `The open workspace is configured for the '${workspaceEnv}' user environment. Switching the device user to '${targetUser}' may break workspace file operations.`,
+                        { modal: true },
+                        'Switch Anyway'
+                    );
+                    if (choice !== 'Switch Anyway') {
+                        return false;
+                    }
+                }
+            }
+
             const shell = await connectionManager.getPersistentShell(deviceId);
             
             if (targetUser === 'shell') {
@@ -679,8 +805,9 @@ export async function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
+            const androidId = await connectionManager.resolveAndroidIdForDevice(deviceItem.device.id) || deviceItem.device.id;
             // For a new window, write it to globalStorageUri so the new window can pick it up
-            const tempKey = `adbValidationManifest_${sanitizeKey(deviceItem.device.id)}_${sanitizeKey(folderPath)}.json`;
+            const tempKey = `adbValidationManifest_${sanitizeKey(androidId)}_${sanitizeKey(folderPath)}.json`;
             const manifestUri = vscode.Uri.joinPath(context.globalStorageUri, tempKey);
             
             try {
@@ -694,7 +821,7 @@ export async function activate(context: vscode.ExtensionContext) {
             // Small delay to ensure file system flush
             await new Promise(resolve => setTimeout(resolve, 500));
 
-            const uri = vscode.Uri.parse(`remote-adb://${deviceItem.device.id}${folderPath}`);
+            const uri = vscode.Uri.parse(`remote-adb://${androidId}${folderPath}`);
             vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true });
         }
     });
