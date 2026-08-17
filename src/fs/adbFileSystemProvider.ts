@@ -685,15 +685,15 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
 
 
     //Following code is for folder picker and will not be used if workspace is opended already
-    private isAccessibleFolderPicker(perms: string, owner: string, group: string, user: { name: string, groups: string[] }): boolean {
-        if (user.name === 'root') return true;
+    private isAccessibleFolderPicker(perms: string, owner: string, group: string, user: { name: string, groups: string[], uid: string, gids: string[] }): boolean {
+        if (user.name === 'root' || user.uid === '0') return true;
         
         let rIndex = 7;
         let xIndex = 9;
         
-        if (user.name === owner) {
+        if (user.name === owner || user.uid === owner) {
             rIndex = 1; xIndex = 3;
-        } else if (user.groups.includes(group) || group === 'everybody') {
+        } else if (user.groups.includes(group) || user.gids.includes(group) || group === 'everybody') {
             rIndex = 4; xIndex = 6;
         }
         
@@ -710,7 +710,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         
         const safePath = escapePath(targetPath);
         // toybox ls -laL dereferences symlinks. We filter for directories 'd'
-        const output = await shell.executeCommand(`${prefix} ls -laL "${safePath}" 2>/dev/null | ${prefix} grep '^d'`);
+        const output = await shell.executeCommand(`ls_out=$(${prefix} ls -laL "${safePath}" 2>&1); ret=$?; if [ $ret -ne 0 ]; then echo "$ls_out"; else echo "$ls_out" | ${prefix} grep '^d'; fi`);
         
         if (output.includes('Permission denied')) {
             throw vscode.FileSystemError.NoPermissions(uri);
@@ -761,16 +761,16 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         return entries;
     }
 
-    private isAccessibleFilePicker(perms: string, owner: string, group: string, user: { name: string, groups: string[] }, isDir: boolean): boolean {
-        if (user.name === 'root') return true;
+    private isAccessibleFilePicker(perms: string, owner: string, group: string, user: { name: string, groups: string[], uid: string, gids: string[] }, isDir: boolean): boolean {
+        if (user.name === 'root' || user.uid === '0') return true;
         
         let rIndex = 7;
         let wIndex = 8;
         let xIndex = 9;
         
-        if (user.name === owner) {
+        if (user.name === owner || user.uid === owner) {
             rIndex = 1; wIndex = 2; xIndex = 3;
-        } else if (user.groups.includes(group) || group === 'everybody') {
+        } else if (user.groups.includes(group) || user.gids.includes(group) || group === 'everybody') {
             rIndex = 4; wIndex = 5; xIndex = 6;
         }
         
@@ -791,7 +791,7 @@ export class AdbFileSystemProvider implements vscode.FileSystemProvider {
         
         const safePath = escapePath(targetPath);
         // toybox ls -laL dereferences symlinks. We filter for files '-', directories 'd' and broken symlinks 'l'
-        const output = await shell.executeCommand(`${prefix} ls -laL "${safePath}" 2>/dev/null | ${prefix} grep '^[-dl]'`);
+        const output = await shell.executeCommand(`ls_out=$(${prefix} ls -laL "${safePath}" 2>&1); ret=$?; if [ $ret -ne 0 ]; then echo "$ls_out"; else echo "$ls_out" | ${prefix} grep '^[-dl]'; fi`);
         
         if (output.includes('Permission denied')) {
             throw vscode.FileSystemError.NoPermissions(uri);

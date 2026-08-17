@@ -21,10 +21,10 @@ export class PersistentAdbShell {
     public isDead = false;
     public isIntendedClose = false;
     public onUnexpectedClose?: () => void;
-    private currentUser: { name: string, groups: string[] } | null = null;
-    private pendingUserPromise: Promise<{ name: string, groups: string[] }> | null = null;
+    private currentUser: { name: string, groups: string[], uid: string, gids: string[] } | null = null;
+    private pendingUserPromise: Promise<{ name: string, groups: string[], uid: string, gids: string[] }> | null = null;
 
-    public async getCurrentUser(forceRefresh: boolean = false): Promise<{ name: string, groups: string[] }> {
+    public async getCurrentUser(forceRefresh: boolean = false): Promise<{ name: string, groups: string[], uid: string, gids: string[] }> {
         if (this.currentUser && !forceRefresh) return this.currentUser;
         
         if (this.pendingUserPromise && !forceRefresh) {
@@ -37,12 +37,17 @@ export class PersistentAdbShell {
                 // If toybox isn't in PATH, 'id' is a fallback.
                 const nameStr = await this.executeCommand('toybox id -un 2>/dev/null || id -un');
                 const groupsStr = await this.executeCommand('toybox id -Gn 2>/dev/null || id -Gn');
+                const uidStr = await this.executeCommand('toybox id -u 2>/dev/null || id -u');
+                const gidsStr = await this.executeCommand('toybox id -G 2>/dev/null || id -G');
+                
                 this.currentUser = {
                     name: nameStr.trim(),
-                    groups: groupsStr.trim().split(/\s+/)
+                    groups: groupsStr.trim().split(/\s+/),
+                    uid: uidStr.trim(),
+                    gids: gidsStr.trim().split(/\s+/)
                 };
             } catch (e) {
-                this.currentUser = { name: 'shell', groups: ['shell'] };
+                this.currentUser = { name: 'shell', groups: ['shell'], uid: '2000', gids: ['2000'] };
             } finally {
                 this.pendingUserPromise = null;
             }
