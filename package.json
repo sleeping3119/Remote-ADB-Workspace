@@ -29,7 +29,12 @@
       },
       {
         "command": "remote-adb.connectTcpip",
-        "title": "Remote ADB: Connect via TCP/IP"
+        "title": "Remote ADB: Connect via Config"
+      },
+      {
+        "command": "remote-adb.connectTcpipDirect",
+        "title": "Remote ADB: Connect via TCP/IP",
+        "icon": "$(add)"
       },
       {
         "command": "remote-adb.pairTcpip",
@@ -116,9 +121,14 @@
     "menus": {
       "view/title": [
         {
+          "command": "remote-adb.connectTcpipDirect",
+          "when": "view == remote-adb.devicesView",
+          "group": "navigation@1"
+        },
+        {
           "command": "remote-adb.refreshDevices",
           "when": "view == remote-adb.devicesView",
-          "group": "navigation"
+          "group": "navigation@2"
         }
       ],
       "view/item/context": [
