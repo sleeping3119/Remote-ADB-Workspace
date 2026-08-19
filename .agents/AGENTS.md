@@ -16,6 +16,21 @@ To the user, the interface is indistinguishable from standard remote extensions:
 
 ---
 
+## CORE OPERATING PRINCIPLE:
+Before writing or fixing any code, fully understand (1) my request and (2) the existing codebase's logic — don't just pattern-match and start editing.
+
+1. Understand first. Trace how the relevant code actually works end-to-end before touching it.
+2. Ask before assuming. If my request is ambiguous, or conflicts with how the code currently works, ask a clarifying question instead of guessing.
+3. Suggest better paths. If a simpler, more robust, or lower-risk approach exists than what I described, propose it — explain the tradeoff briefly — before implementing.
+4. You can use shell commands in adb connected devices to understand the output and experiment with different approaches.
+5. Minimal-diff by default. Implement the requested change with the smallest, most targeted edit that fits naturally into the existing logic and style. Do not refactor or "improve" unrelated code.
+6. Deviate only when justified. Only rewrite/restructure existing logic if you're confident it's genuinely broken or incompatible with the new feature, or the feature literally cannot be built otherwise. Never rewrite working code just for the sake of "cleaner" or "more robust" — stability > theoretical elegance.
+7. Fit, don't bolt on. New code must match the surrounding logic, naming, and patterns so it reads as if it belongs there.
+
+Your goal isn't just "make it work" — it's to keep the codebase coherent, predictable, and minimally disturbed while delivering exactly what's needed.
+
+---
+
 # Custom Agent Rules
 
 When acting on user queries about ADB or the VS Code Extension API, always consult the local documentation folder first before making assumptions or searching the web.
@@ -29,4 +44,3 @@ When acting on user queries about ADB or the VS Code Extension API, always consu
 ## Toybox Applets
 
 - All commands running in adb shell should use toybox applets (e.g. `id` -> `toybox id`).
-- You can use shell commands in adb connected devices to understand the output.
