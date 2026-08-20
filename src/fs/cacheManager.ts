@@ -89,10 +89,10 @@ export class CacheManager {
         }
     }
 
-    public async initializeCache(deviceId: string, workspaceRoot: string): Promise<void> {
+    public async initializeCache(deviceId: string, workspaceRoot: string, force: boolean = false): Promise<void> {
         const stateKey = `cache_initialized_${deviceId}_${workspaceRoot}`;
         
-        if (this.context.workspaceState.get(stateKey)) {
+        if (!force && this.context.workspaceState.get(stateKey)) {
             Logger.logOutput(`[CacheManager] Cache already initialized for ${workspaceRoot}`);
             return;
         }

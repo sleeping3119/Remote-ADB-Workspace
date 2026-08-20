@@ -72,6 +72,10 @@
         "title": "Remote ADB: Open Folder"
       },
       {
+        "command": "remote-adb.rebuildCache",
+        "title": "Remote ADB: Rebuild Workspace Cache"
+      },
+      {
         "command": "remote-adb.switchUserRoot",
         "title": "Switch User: Root"
       },

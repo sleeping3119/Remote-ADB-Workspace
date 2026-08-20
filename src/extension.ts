@@ -564,6 +564,27 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(openFolderDisposable, openFileDisposable);
 
+    let rebuildCacheDisposable = vscode.commands.registerCommand('remote-adb.rebuildCache', async () => {
+        const adbFolders = vscode.workspace.workspaceFolders?.filter(f => f.uri.scheme === 'remote-adb');
+        if (!adbFolders || adbFolders.length === 0) {
+            vscode.window.showInformationMessage('No Remote ADB workspace folder is currently open.');
+            return;
+        }
+
+        for (const folder of adbFolders) {
+            const deviceId = folder.uri.authority;
+            const folderPath = folder.uri.path;
+            try {
+                await cacheManager.initializeCache(deviceId, folderPath, true);
+                vscode.window.showInformationMessage(`Workspace cache rebuilt successfully for ${folderPath}`);
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`Failed to rebuild cache for ${folderPath}: ${e.message}`);
+            }
+        }
+    });
+
+    context.subscriptions.push(rebuildCacheDisposable);
+
     context.subscriptions.push(vscode.commands.registerCommand('remote-adb.handleUnauthorizedDevice', async (item: DeviceTreeItem) => {
         if (!item || !item.device) return;
         vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Resolving unauthorized device..." }, async () => {
