@@ -642,17 +642,15 @@ export async function activate(context: vscode.ExtensionContext) {
                 toyboxManager.setRawFolderPath(deviceId, user.name, absTargetFolder);
                 await toyboxManager.getRawFolderPath(deviceId, user.name, shell);
 
-                const checkRaw = await shell.executeCommand('ls -A /data/local/tmp/.raw 2>/dev/null');
-                if (checkRaw.trim()) {
-                    const testLocal = await shell.executeCommand(`${absTargetFolder}/toybox --version`);
-                    if (testLocal.includes('not found') || testLocal.includes('inaccessible') || testLocal.includes('No such file')) {
-                        await shell.executeCommand(`cat /data/local/tmp/.raw/toybox > ${absTargetFolder}/toybox`);
-                        await shell.executeCommand(`chmod 700 ${absTargetFolder}/toybox`);
-                    }
-                    toyboxManager.setToyboxPrefix(deviceId, user.name, `${absTargetFolder}/toybox`);
-                } else {
-                    toyboxManager.setToyboxPrefix(deviceId, user.name, 'toybox');
+                // Force ToyboxManager to ensure the global shell toybox is pushed and available.
+                await toyboxManager.getToyboxPrefix(deviceId, 'shell');
+
+                const testLocal = await shell.executeCommand(`${absTargetFolder}/toybox --version`);
+                if (testLocal.includes('not found') || testLocal.includes('inaccessible') || testLocal.includes('No such file') || testLocal.includes('Permission denied')) {
+                    await shell.executeCommand(`cat /data/local/tmp/.raw/toybox > ${absTargetFolder}/toybox`);
+                    await shell.executeCommand(`chmod 700 ${absTargetFolder}/toybox`);
                 }
+                toyboxManager.setToyboxPrefix(deviceId, user.name, `${absTargetFolder}/toybox`);
                 shell.activeSwitchCommand = { type: pkgName === 'com.termux' ? 'termux' : 'custom', pkgName };
                 vscode.window.showInformationMessage(`Switched to ${pkgName}`);
                 vscode.commands.executeCommand('remote-adb.refreshDevices');

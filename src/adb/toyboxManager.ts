@@ -1,7 +1,7 @@
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as https from 'https';
+
 import * as vscode from 'vscode';
 
 import { PlatformToolsManager } from './platformToolsManager';
@@ -87,24 +87,16 @@ export class ToyboxManager {
             await this.getRawFolderPath(deviceId, username);
         }
 
-        // 1. Check if natively available
-        try {
-            await this.execAdb(deviceId, 'shell toybox --version');
-            this.setToyboxPrefix(deviceId, username, 'toybox');
-            return 'toybox';
-        } catch (e) {
-            // Natively not available, proceed to check TOYBOX_PATH
-        }
-
+        // 1. Check if already pushed
         try {
             await this.execAdb(deviceId, `shell ${TOYBOX_PATH} --version`);
             this.setToyboxPrefix(deviceId, username, TOYBOX_PATH);
             return TOYBOX_PATH;
         } catch (e) {
-            // Not in .raw either
+            // Not in .raw, need to push bundled version
         }
 
-        // 2. Need to download and push
+        // 2. Need to push bundled binary
         return await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: `Installing Toybox for device ${deviceId}...`,
@@ -113,16 +105,11 @@ export class ToyboxManager {
             const abi = (await this.execAdb(deviceId, 'shell getprop ro.product.cpu.abi')).trim();
             const toyboxBinaryName = this.mapAbiToToybox(abi);
             
-            const storagePath = this.context.globalStorageUri.fsPath;
-            if (!fs.existsSync(storagePath)) {
-                fs.mkdirSync(storagePath, { recursive: true });
-            }
-            const localToyboxPath = path.join(storagePath, `toybox-${toyboxBinaryName}`);
+            const localToyboxPath = path.join(this.context.extensionUri.fsPath, 'resources', 'toybox', toyboxBinaryName);
 
             if (!fs.existsSync(localToyboxPath)) {
-                progress.report({ message: `Downloading toybox for ${abi}...` });
-                const url = `https://landley.net/bin/toybox/latest/${toyboxBinaryName}`;
-                await this.downloadFile(url, localToyboxPath);
+                vscode.window.showErrorMessage(`Bundled toybox binary not found at ${localToyboxPath}`);
+                throw new Error(`Bundled toybox not found for ABI ${abi}`);
             }
 
             progress.report({ message: `Pushing toybox to device...` });
@@ -162,29 +149,5 @@ export class ToyboxManager {
         });
     }
 
-    private downloadFile(url: string, dest: string): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const file = fs.createWriteStream(dest);
-            https.get(url, (response) => {
-                if (response.statusCode === 302 || response.statusCode === 301) {
-                    if (response.headers.location) {
-                        this.downloadFile(response.headers.location, dest).then(resolve).catch(reject);
-                        return;
-                    }
-                }
-                if (response.statusCode !== 200) {
-                    reject(new Error(`Failed to download: ${response.statusCode}`));
-                    return;
-                }
-                response.pipe(file);
-                file.on('finish', () => {
-                    file.close();
-                    resolve();
-                });
-            }).on('error', (err) => {
-                fs.unlinkSync(dest);
-                reject(err);
-            });
-        });
-    }
+
 }
