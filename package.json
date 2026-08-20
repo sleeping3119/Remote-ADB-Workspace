@@ -3,6 +3,11 @@
   "displayName": "Remote ADB",
   "description": "Remote ADB Extension for VS Code",
   "version": "0.0.1",
+  "publisher": "sleeping3119",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sleeping3119/Remote-ADB-Workspace.git"
+  },
   "icon": "resources/icon.png",
   "engines": {
     "vscode": "^1.85.0"
