@@ -620,10 +620,14 @@ export async function activate(context: vscode.ExtensionContext) {
     }));
 
     async function setupAppEnvironment(deviceId: string, pkgName: string, shell: import('./adb/connectionManager').PersistentAdbShell, targetFolder: string = '.raw') {
+        if (!/^[a-zA-Z0-9_.]+$/.test(pkgName)) {
+            vscode.window.showErrorMessage(`Invalid package name format: ${pkgName}`);
+            return false;
+        }
         return new Promise<boolean>(async (resolve) => {
             const cp = require('child_process');
             const adbPath = await toolsManager.getAdbPath();
-            cp.exec(`"${adbPath}" -s ${deviceId} shell run-as ${pkgName} id`, async (err: any, stdout: string, stderr: string) => {
+            cp.execFile(adbPath, ['-s', deviceId, 'shell', 'run-as', pkgName, 'id'], async (err: any, stdout: string, stderr: string) => {
                 const out = (stdout + '' + stderr).toLowerCase();
                 if (out.includes('unknown package') || out.includes('is not installed')) {
                     vscode.window.showErrorMessage(`Package not installed: ${pkgName}`);
@@ -772,7 +776,14 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(vscode.commands.registerCommand('remote-adb.switchUserCustom', async (deviceItem: DeviceTreeItem) => {
         if (!deviceItem) return;
-        const pkgName = await vscode.window.showInputBox({ prompt: 'Enter package name of debuggable app' });
+        const pkgName = await vscode.window.showInputBox({
+            prompt: 'Enter package name of debuggable app',
+            validateInput: (value) => {
+                if (!value) return 'Package name cannot be empty';
+                if (!/^[a-zA-Z0-9_.]+$/.test(value)) return 'Invalid package name format';
+                return null;
+            }
+        });
         if (!pkgName) return;
         await switchDeviceUser(deviceItem.device.id, 'custom', pkgName);
     }));
