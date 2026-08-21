@@ -1,0 +1,62 @@
+name: Build and Release VS Code Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install VSCE
+        run: npm install -g @vscode/vsce
+
+      - name: Fix VS Code engine version for packaging
+        # The package currently fails packaging with an error:
+        # @types/vscode ^1.125.0 greater than engines.vscode ^1.85.0
+        # By setting the engine to match, we can bypass the vsce error.
+        run: |
+          sed -i 's/"vscode": "^1.85.0"/"vscode": "^1.125.0"/g' package.json
+
+      - name: Package Extension
+        run: vsce package
+
+      - name: Determine Release Type
+        id: release-type
+        run: |
+          # Extract the version from the tag, e.g., v1.2.3 -> 1.2.3
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          # Get the minor version (second number)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          # Check if the minor version is odd or even
+          if [ $((MINOR % 2)) -eq 0 ]; then
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+            echo "Release is STABLE (even minor version: $MINOR)"
+          else
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+            echo "Release is PRE-RELEASE (odd minor version: $MINOR)"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ steps.release-type.outputs.is_prerelease == 'true' }}
+          files: "*.vsix"
+          generate_release_notes: true
