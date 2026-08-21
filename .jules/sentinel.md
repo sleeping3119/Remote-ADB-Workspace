@@ -1,0 +1,4 @@
+## 2024-05-18 - [Command Injection via Unsanitized User Input in cp.exec]
+**Vulnerability:** Found multiple instances where user-supplied inputs (`ipPort`, `pkgName`, etc.) were directly concatenated into `cp.exec` shell commands, allowing for severe OS command injection on the extension host.
+**Learning:** `cp.exec` inherently passes its string argument directly to the host's shell. When handling dynamic inputs (especially those obtained via `showInputBox` like package names or IP:Port combinations), we MUST either strictly validate/sanitize the input against a regex or use `cp.execFile`/`cp.spawn` which pass arguments as an array instead of a shell-interpolated string.
+**Prevention:** Avoid `cp.exec` whenever possible in favor of `cp.execFile` or `cp.spawn`. If `cp.exec` must be used for pipelines or shell built-ins, strictly validate input with regexes to ensure no shell metacharacters exist.

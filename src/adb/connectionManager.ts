@@ -390,7 +390,7 @@ export class ConnectionManager {
             const realId = await this.resolveDeviceId(deviceId);
             const cp = require('child_process');
             return await new Promise((resolve) => {
-                cp.exec(`"${adbPath}" -s ${realId} shell id -un`, (err: any, stdout: string) => {
+                cp.execFile(adbPath, ['-s', realId, 'shell', 'id', '-un'], (err: any, stdout: string) => {
                     resolve(stdout.trim() || 'shell');
                 });
             });
@@ -467,6 +467,9 @@ export class ConnectionManager {
     }
 
     public async connect(ipPort: string): Promise<string> {
+        if (!/^[a-zA-Z0-9.:\-]+$/.test(ipPort)) {
+            throw new Error('Invalid IP/Port format');
+        }
         const result = await this.executeAdbCommand(`connect ${ipPort}`);
         if (!result.includes('failed to connect to') && !result.includes('actively refused it') && !result.includes('cannot connect to')) {
             this.addKnownTcpDevice(ipPort);
@@ -483,14 +486,26 @@ export class ConnectionManager {
     }
 
     public async pair(ipPort: string, code: string): Promise<string> {
+        if (!/^[a-zA-Z0-9.:\-]+$/.test(ipPort)) {
+            throw new Error('Invalid IP/Port format');
+        }
+        if (!/^[0-9]+$/.test(code)) {
+            throw new Error('Invalid pairing code format');
+        }
         return this.executeAdbCommand(`pair ${ipPort} ${code}`);
     }
 
     public async disconnect(target: string): Promise<string> {
+        if (!/^[a-zA-Z0-9.:\-]+$/.test(target)) {
+            throw new Error('Invalid target format');
+        }
         return this.executeAdbCommand(`disconnect ${target}`);
     }
 
     public async tcpip(port: string): Promise<string> {
+        if (!/^[0-9]+$/.test(port)) {
+            throw new Error('Invalid port format');
+        }
         return this.executeAdbCommand(`tcpip ${port}`);
     }
 
