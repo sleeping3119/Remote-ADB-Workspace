@@ -28,13 +28,6 @@ jobs:
       - name: Install VSCE
         run: npm install -g @vscode/vsce
 
-      - name: Fix VS Code engine version for packaging
-        # The package currently fails packaging with an error:
-        # @types/vscode ^1.125.0 greater than engines.vscode ^1.85.0
-        # By setting the engine to match, we can bypass the vsce error.
-        run: |
-          sed -i 's/"vscode": "^1.85.0"/"vscode": "^1.125.0"/g' package.json
-
       - name: Package Extension
         run: vsce package
 

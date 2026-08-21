@@ -2,7 +2,7 @@
   "name": "remote-adb",
   "displayName": "Remote ADB",
   "description": "Remote ADB Extension for VS Code",
-  "version": "0.0.1",
+  "version": "1.1.0",
   "publisher": "sleeping3119",
   "repository": {
     "type": "git",
@@ -237,7 +237,7 @@
     "@types/adm-zip": "^0.5.8",
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
-    "@types/vscode": "^1.125.0",
+    "@types/vscode": "^1.85.0",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
     "eslint": "^10.5.0",
